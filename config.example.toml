@@ -1,0 +1,69 @@
+# speakd configuration
+#
+# Copy to ~/.config/speakd/config.toml (or point $SPEAKD_CONFIG at it).
+# Every key is optional — the built-in defaults work out of the box on CPU.
+# Environment variables (SPEAKD_*) override anything set here.
+
+[tts]
+# Kokoro voice id. A few favourites:
+#   af_heart, af_bella, af_nicole  (American female)
+#   am_adam, am_michael            (American male)
+#   bf_emma, bf_isabella           (British female)
+#   bm_george                      (British male)
+voice = "af_heart"
+
+# Speech-rate multiplier (1.0 = normal).
+speed = 1.0
+
+# Kokoro language code: "a" = American English, "b" = British English, ...
+lang_code = "a"
+
+[device]
+# "auto" — dynamic offload (recommended): load on CPU, hop to the GPU for
+#          synthesis bursts, release VRAM after `keepalive_seconds` idle.
+# "cpu"  — never touch the GPU.
+# "gpu"  — move to the GPU on first use and stay there.
+policy = "auto"
+
+# Idle seconds before the model is offloaded from GPU back to CPU.
+keepalive_seconds = 180
+
+[daemon]
+# Unix socket the daemon listens on.
+# Default: $XDG_RUNTIME_DIR/speakd.sock (falls back to /tmp/speakd-<uid>.sock).
+#socket_path = "/run/user/1000/speakd.sock"
+
+# Octal permissions applied to the socket file.
+socket_mode = "600"
+
+# Where an auto-spawned daemon writes its log.
+# Default: ~/.local/state/speakd/daemon.log
+#log_file = "/home/me/.local/state/speakd/daemon.log"
+
+[audio]
+# Playback volume 0-130 (mpv scale; 100 = nominal, >100 = software gain).
+volume = 100
+
+# Kill playback of a single line after this many seconds (safety net).
+max_playback_seconds = 120
+
+# Audio player argv template. "{file}" is the wav path, "{volume}" the
+# current volume. Swap in any player you like, e.g. ffplay:
+#   player = ["ffplay", "-nodisp", "-autoexit", "-volume", "{volume}", "{file}"]
+player = ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
+
+[fallback]
+# Spoken when Kokoro or audio playback fails (and by the client when the
+# daemon cannot be reached). "{text}" is the line to speak.
+# Set to [] to disable the fallback entirely.
+command = ["espeak", "-s", "160", "-v", "en-us", "{text}"]
+
+[client]
+# Socket connect/send timeout (seconds). Keep small: callers should never block.
+connect_timeout = 0.5
+
+# How long `speak --blocking` waits for the spoken-ack.
+ack_timeout = 300.0
+
+# How long the client waits for an auto-spawned daemon to come up.
+spawn_wait = 4.0

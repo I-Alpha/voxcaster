@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speakd"
+version = "0.1.0"
+description = "Fire-and-forget local TTS narration: a Kokoro-powered speech daemon behind a Unix socket, with dynamic GPU offload, an interrupt protocol, and graceful fallback."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "ibrahim Alfa" }]
+requires-python = ">=3.10"
+keywords = ["tts", "text-to-speech", "kokoro", "daemon", "unix-socket", "narration", "notifications"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "kokoro>=0.9",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+speakd = "speakd.daemon:main"
+speak = "speakd.client:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

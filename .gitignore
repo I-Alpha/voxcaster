@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Local config and logs (never commit machine-specific state)
+config.toml
+*.log
