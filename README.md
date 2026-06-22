@@ -1,12 +1,12 @@
-# speakd
+# voxcaster
 
-[![PyPI](https://img.shields.io/pypi/v/speakd)](https://pypi.org/project/speakd/)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/speakd)](https://pypi.org/project/speakd/)
+[![PyPI](https://img.shields.io/pypi/v/voxcaster)](https://pypi.org/project/voxcaster/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/voxcaster)](https://pypi.org/project/voxcaster/)
 
 **A local text-to-speech daemon and CLI for speech notifications from
 long-running jobs.**
 
-`speakd` is a Python TTS daemon powered by
+`voxcaster` is a Python TTS daemon powered by
 [Kokoro](https://github.com/hexgrad/kokoro) (a fast, high-quality local
 text-to-speech model). Shell scripts, machine-learning training runs, builds,
 cron jobs, CI hooks, and Python programs can send fire-and-forget speech
@@ -20,7 +20,7 @@ offloads itself from the GPU** when narration goes quiet, so it never holds
 VRAM hostage from the workload it is narrating.
 
 ```
-$ pip install speakd
+$ pip install voxcaster
 $ speak "training started"          # daemon auto-spawns on first use
 $ speak --interrupt "loss is NaN"   # cuts off whatever is playing, speaks NOW
 $ make 2>&1 | tail -1 | speak       # pipe-friendly
@@ -41,7 +41,7 @@ $ make 2>&1 | tail -1 | speak       # pipe-friendly
 
 Calling a TTS library inline is the obvious approach and the wrong one for
 narration: it blocks the caller for seconds per line, loads a model per
-process, and overlapping lines talk over each other. `speakd` inverts this:
+process, and overlapping lines talk over each other. `voxcaster` inverts this:
 
 - **~1 ms per call.** The client writes one line to a Unix socket and returns.
   Narration can sit inside hot loops and signal handlers.
@@ -53,7 +53,7 @@ process, and overlapping lines talk over each other. `speakd` inverts this:
 ## Architecture
 
 ```
- any process, any language                 speakd daemon (one per socket, flock-enforced)
+ any process, any language                 voxcaster daemon (one per socket, flock-enforced)
 ┌──────────────────────┐            ┌───────────────────────────────────────────────┐
 │  speak "epoch done"  │──┐         │   asyncio Unix-socket server                  │
 └──────────────────────┘  │         │        │                                      │
@@ -106,16 +106,16 @@ process, and overlapping lines talk over each other. `speakd` inverts this:
 ## Install
 
 ```bash
-pip install speakd
+pip install voxcaster
 ```
 
 This installs the `kokoro` TTS package (which pulls in PyTorch) and two
-console commands: `speakd` (the daemon) and `speak` (the client).
+console commands: `voxcaster` (the daemon) and `speak` (the client).
 
 To install from source:
 
 ```bash
-git clone https://github.com/I-Alpha/speakd && cd speakd
+git clone https://github.com/I-Alpha/voxcaster && cd voxcaster
 pip install .
 ```
 
@@ -123,10 +123,10 @@ pip install .
 
 ```bash
 # 1. Just speak — the daemon auto-spawns on first use:
-speak "hello from speakd"
+speak "hello from voxcaster"
 
 # 2. Or run the daemon in the foreground to watch it work:
-speakd --device cpu --voice af_heart
+voxcaster --device cpu --voice af_heart
 
 # 3. Script it:
 speak --blocking "waits until this has been spoken"
@@ -138,7 +138,7 @@ echo "pipes work too" | speak
 From Python:
 
 ```python
-from speakd import speak, set_volume
+from voxcaster import speak, set_volume
 
 speak("checkpoint saved")                        # ~1 ms, non-blocking
 speak("eval finished", blocking=True)            # wait until spoken
@@ -152,7 +152,7 @@ and volume control.
 ## Configuration
 
 Defaults work with no config at all. To customise, copy
-[`config.example.toml`](config.example.toml) to `~/.config/speakd/config.toml`
+[`config.example.toml`](config.example.toml) to `~/.config/voxcaster/config.toml`
 (or point `$SPEAKD_CONFIG` at any path). Environment variables override the
 file; CLI flags override both.
 
@@ -163,9 +163,9 @@ file; CLI flags override both.
 | `tts.lang_code` | `SPEAKD_LANG` | `a` | Kokoro language code (`a` US English, `b` UK English) |
 | `device.policy` | `SPEAKD_DEVICE` | `auto` | `auto` (dynamic offload) / `cpu` / `gpu` |
 | `device.keepalive_seconds` | `SPEAKD_KEEPALIVE` | `180` | Idle seconds before GPU→CPU offload |
-| `daemon.socket_path` | `SPEAKD_SOCKET` | `$XDG_RUNTIME_DIR/speakd.sock` | Unix socket path |
+| `daemon.socket_path` | `SPEAKD_SOCKET` | `$XDG_RUNTIME_DIR/voxcaster.sock` | Unix socket path |
 | `daemon.socket_mode` | — | `"600"` | Octal permissions on the socket file |
-| `daemon.log_file` | `SPEAKD_LOG_FILE` | `~/.local/state/speakd/daemon.log` | Log target for auto-spawned daemons |
+| `daemon.log_file` | `SPEAKD_LOG_FILE` | `~/.local/state/voxcaster/daemon.log` | Log target for auto-spawned daemons |
 | `audio.volume` | `SPEAKD_VOLUME` | `100` | Playback volume `0–130` (mpv scale) |
 | `audio.max_playback_seconds` | — | `120` | Kill a single line's playback after this |
 | `audio.player` | — | mpv template | Player argv; `{file}` and `{volume}` are substituted |
@@ -174,7 +174,7 @@ file; CLI flags override both.
 | `client.ack_timeout` | — | `300.0` | `--blocking` wait for the spoken-ack (s) |
 | `client.spawn_wait` | — | `4.0` | Wait for an auto-spawned daemon (s) |
 
-`speakd --print-config` shows the fully-resolved effective configuration.
+`voxcaster --print-config` shows the fully-resolved effective configuration.
 
 ## Wire protocol
 
@@ -189,7 +189,7 @@ language without a client library:
 
 ```bash
 # speak from raw shell, no client needed:
-printf 'hello from netcat\n' | nc -U "$XDG_RUNTIME_DIR/speakd.sock"
+printf 'hello from netcat\n' | nc -U "$XDG_RUNTIME_DIR/voxcaster.sock"
 ```
 
 The control markers are ASCII SOH/STX characters that cannot occur in normal
@@ -216,12 +216,12 @@ the model can never be moved mid-utterance.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `speak` says *fallback engine used* | Daemon failed to start — check `~/.local/state/speakd/daemon.log`. Most common: `kokoro` not installed in the Python that spawned it (set `SPEAKD_DAEMON_CMD="/path/to/python -m speakd.daemon"`). |
+| `speak` says *fallback engine used* | Daemon failed to start — check `~/.local/state/voxcaster/daemon.log`. Most common: `kokoro` not installed in the Python that spawned it (set `SPEAKD_DAEMON_CMD="/path/to/python -m voxcaster.daemon"`). |
 | No audio, no errors | Is `mpv` installed and does it play a wav from your terminal? Swap `audio.player` if you use a different player. |
 | First line is slow | Cold start: model weights load on first request (a few seconds). Subsequent lines are fast. |
 | Robotic voice instead of Kokoro | That *is* the espeak fallback working as designed — see the first row. |
 | Two daemons after a crash | They cannot coexist: the flock singleton makes the second exit immediately, and stale sockets are cleaned on startup. Delete `<socket>.lock` only if a machine crash left it owned by a dead PID holder (flock releases on process death, so this is near-impossible). |
-| `daemon already running (pid N)` | Working as intended — the running daemon serves all clients. |
+| `voxcaster already running (pid N)` | Working as intended — the running daemon serves all clients. |
 | GPU memory not released | The model offloads after `device.keepalive_seconds` of *no requests*; lower it, or run with `--device cpu`. |
 
 ## License

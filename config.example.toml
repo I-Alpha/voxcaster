@@ -1,6 +1,6 @@
-# speakd configuration
+# voxcaster configuration
 #
-# Copy to ~/.config/speakd/config.toml (or point $SPEAKD_CONFIG at it).
+# Copy to ~/.config/voxcaster/config.toml (or point $SPEAKD_CONFIG at it).
 # Every key is optional — the built-in defaults work out of the box on CPU.
 # Environment variables (SPEAKD_*) override anything set here.
 
@@ -18,6 +18,11 @@ speed = 1.0
 # Kokoro language code: "a" = American English, "b" = British English, ...
 lang_code = "a"
 
+# Strip markdown (code fences, URLs, headers, bold/italic, table pipes, HTML)
+# and extract an embedded <!-- TTS_SUMMARY ... TTS_SUMMARY --> before synthesis.
+# Makes raw LLM/CLI output safe to pipe straight into `speak`. Default: true.
+markdown_preprocess = true
+
 [device]
 # "auto" — dynamic offload (recommended): load on CPU, hop to the GPU for
 #          synthesis bursts, release VRAM after `keepalive_seconds` idle.
@@ -30,15 +35,20 @@ keepalive_seconds = 180
 
 [daemon]
 # Unix socket the daemon listens on.
-# Default: $XDG_RUNTIME_DIR/speakd.sock (falls back to /tmp/speakd-<uid>.sock).
-#socket_path = "/run/user/1000/speakd.sock"
+# Default: $XDG_RUNTIME_DIR/voxcaster.sock (falls back to /tmp/voxcaster-<uid>.sock).
+#socket_path = "/run/user/1000/voxcaster.sock"
 
 # Octal permissions applied to the socket file.
 socket_mode = "600"
 
+# Treat every request as an interrupt: each new line drains the queue and cuts
+# off in-flight playback, so only the latest narration is ever spoken. Handy
+# for Claude Code hooks where stale lines aren't worth hearing. Default: false.
+always_interrupt = false
+
 # Where an auto-spawned daemon writes its log.
-# Default: ~/.local/state/speakd/daemon.log
-#log_file = "/home/me/.local/state/speakd/daemon.log"
+# Default: ~/.local/state/voxcaster/daemon.log
+#log_file = "/home/me/.local/state/voxcaster/daemon.log"
 
 [audio]
 # Playback volume 0-130 (mpv scale; 100 = nominal, >100 = software gain).

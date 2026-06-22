@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "speakd"
-version = "0.1.0"
+name = "voxcaster"
+version = "0.2.0"
 description = "Local text-to-speech daemon and CLI for speech notifications from scripts, builds, cron jobs, and ML training runs, powered by Kokoro TTS with GPU offload and espeak fallback."
 readme = "README.md"
 license = { text = "MIT" }
@@ -49,14 +49,14 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/I-Alpha/speakd"
-Repository = "https://github.com/I-Alpha/speakd"
-Issues = "https://github.com/I-Alpha/speakd/issues"
-Changelog = "https://github.com/I-Alpha/speakd/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/I-Alpha/voxcaster"
+Repository = "https://github.com/I-Alpha/voxcaster"
+Issues = "https://github.com/I-Alpha/voxcaster/issues"
+Changelog = "https://github.com/I-Alpha/voxcaster/blob/master/CHANGELOG.md"
 
 [project.scripts]
-speakd = "speakd.daemon:main"
-speak = "speakd.client:main"
+voxcaster = "voxcaster.daemon:main"
+speak = "voxcaster.client:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
