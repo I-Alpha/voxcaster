@@ -1,22 +1,22 @@
-"""The speakd daemon: a fire-and-forget TTS narration queue behind a Unix socket.
+"""The voxcaster daemon: a fire-and-forget TTS narration queue behind a Unix socket.
 
 Design
 ------
 - One asyncio Unix-socket server accepts newline-terminated requests
-  (see :mod:`speakd.protocol`) and feeds a FIFO queue.
+  (see :mod:`voxcaster.protocol`) and feeds a FIFO queue.
 - A single worker drains the queue, synthesizing each line with Kokoro in a
   thread executor (the event loop never blocks on the model) and playing it
   through an external audio player.
 - An interrupt request drains everything queued, kills in-flight playback,
   and jumps its own text to the front.
 - An idle timer offloads the model from GPU to CPU after a configurable
-  keepalive, releasing VRAM for other workloads (see :mod:`speakd.engine`).
+  keepalive, releasing VRAM for other workloads (see :mod:`voxcaster.engine`).
 - A flock(2) singleton guarantees at most one daemon per socket path, so
   clients may race to auto-spawn it without harm.
 - If synthesis or playback fails, the line is spoken through a configurable
   fallback engine (espeak by default) — narration degrades, never disappears.
 
-Run it with ``speakd`` (installed console script) or ``python -m speakd.daemon``.
+Run it with ``speakd`` (installed console script) or ``python -m voxcaster.daemon``.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from . import __version__, protocol
 from .config import Config, load_config
 from .engine import KokoroEngine, SynthesisError
 
-log = logging.getLogger("speakd.daemon")
+log = logging.getLogger("voxcaster.daemon")
 
 # Seconds a connected client gets to deliver its single request line.
 READLINE_TIMEOUT_SEC = 5.0
@@ -72,10 +72,10 @@ class VoiceDaemon:
 
     # ── synthesis + playback (blocking; runs in a thread executor) ────────
 
-    def _speak_sync(self, text: str) -> None:
+    def _speak_sync(self, text: str, voice: str | None = None) -> None:
         epoch = self._interrupt_epoch
         try:
-            wav, sample_rate = self.engine.synthesize(text)
+            wav, sample_rate = self.engine.synthesize(text, voice=voice)
         except SynthesisError as e:
             log.warning("synthesis failed — using fallback: %s", e)
             self._speak_fallback(text)
@@ -153,11 +153,11 @@ class VoiceDaemon:
         """Drain the queue one line at a time; ack each client when spoken."""
         while not self._stop.is_set():
             try:
-                text, writer = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                text, voice, writer = await asyncio.wait_for(self._queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             try:
-                await loop.run_in_executor(None, self._speak_sync, text)
+                await loop.run_in_executor(None, self._speak_sync, text, voice)
             except Exception:
                 # _speak_sync handles its own fallbacks; this guards the worker
                 # task against anything unexpected so the queue never stalls.
@@ -170,13 +170,14 @@ class VoiceDaemon:
                 pass  # fire-and-forget client already hung up
             self._queue.task_done()
 
-    async def _interrupt(self, text: str, writer: asyncio.StreamWriter) -> None:
+    async def _interrupt(self, text: str, writer: asyncio.StreamWriter,
+                         voice: str | None = None) -> None:
         """Drain pending lines, cut off playback, speak ``text`` next."""
         self._interrupt_epoch += 1  # marks any in-flight synthesis as superseded
         drained = 0
         while True:
             try:
-                _old_text, old_writer = self._queue.get_nowait()
+                _old_text, _old_voice, old_writer = self._queue.get_nowait()
                 self._queue.task_done()
                 drained += 1
                 try:
@@ -188,7 +189,7 @@ class VoiceDaemon:
         killed = self._kill_current_player()
         log.info("[interrupt] drained %d queued, stopped current=%s: %s",
                  drained, killed, text[:60])
-        await self._queue.put((text, writer))
+        await self._queue.put((text, voice, writer))
 
     async def _idle_offload(self, loop: asyncio.AbstractEventLoop) -> None:
         """Move the model off the GPU after ``keepalive_seconds`` of quiet."""
@@ -215,6 +216,15 @@ class VoiceDaemon:
             if not text:
                 writer.close()
                 return
+            if text.startswith(protocol.PING_MARKER):
+                reply = protocol.PING_READY if self.engine.is_ready() else protocol.PING_STARTING
+                try:
+                    writer.write(reply)
+                    await writer.drain()
+                except Exception:
+                    pass
+                writer.close()
+                return
             if text.startswith(protocol.VOLUME_MARKER):
                 try:
                     self.volume = protocol.clamp_volume(
@@ -225,14 +235,28 @@ class VoiceDaemon:
                     pass
                 writer.close()
                 return
-            if text.startswith(protocol.INTERRUPT_MARKER):
-                payload = text[len(protocol.INTERRUPT_MARKER):]
-                if payload:
-                    await self._interrupt(payload, writer)
-                else:
-                    writer.close()
+
+            # Strip the interrupt prefix (outermost), then the voice prefix.
+            interrupt = text.startswith(protocol.INTERRUPT_MARKER)
+            if interrupt:
+                text = text[len(protocol.INTERRUPT_MARKER):]
+            voice: str | None = None
+            if text.startswith(protocol.VOICE_MARKER):
+                rest = text[len(protocol.VOICE_MARKER):]
+                voice, _, text = rest.partition("\x03")
+                voice = voice or None
+
+            if self.cfg.markdown_preprocess:
+                from .markdown import preprocess_for_speech
+                text = preprocess_for_speech(text).strip()
+            if not text:
+                writer.close()
+                return
+
+            if interrupt or self.cfg.always_interrupt:
+                await self._interrupt(text, writer, voice=voice)
             else:
-                await self._queue.put((text, writer))
+                await self._queue.put((text, voice, writer))
         except Exception:
             writer.close()
 
@@ -265,7 +289,7 @@ class VoiceDaemon:
         self._remove_stale_socket()
         server = await asyncio.start_unix_server(self._handle, path=self.cfg.socket_path)
         os.chmod(self.cfg.socket_path, self.cfg.socket_mode)
-        log.info("speakd %s ready  voice=%s  socket=%s",
+        log.info("voxcaster %s ready  voice=%s  socket=%s",
                  __version__, self.cfg.voice, self.cfg.socket_path)
 
         def _shutdown(sig: int) -> None:
@@ -291,7 +315,7 @@ class VoiceDaemon:
 
         if os.path.exists(self.cfg.socket_path):
             os.unlink(self.cfg.socket_path)
-        log.info("speakd stopped")
+        log.info("voxcaster stopped")
 
 
 # ── singleton lock ──────────────────────────────────────────────────────────
@@ -327,7 +351,7 @@ def acquire_singleton_lock(lock_path: str):
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="speakd",
+        prog="voxcaster",
         description="Fire-and-forget TTS narration daemon (Kokoro over a Unix socket).",
     )
     parser.add_argument("--config", metavar="PATH", help="TOML config file")
@@ -337,9 +361,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--voice", help="Kokoro voice id override (e.g. af_heart, bf_emma)")
     parser.add_argument("--volume", type=int, metavar="N",
                         help="initial playback volume (0-130)")
+    parser.add_argument("--no-markdown", dest="markdown_preprocess",
+                        action="store_false", default=None,
+                        help="disable markdown stripping / TTS_SUMMARY extraction")
+    parser.add_argument("--always-interrupt", dest="always_interrupt",
+                        action="store_true", default=None,
+                        help="treat every request as an interrupt (speak latest only)")
     parser.add_argument("--print-config", action="store_true",
                         help="print the effective configuration and exit")
-    parser.add_argument("--version", action="version", version=f"speakd {__version__}")
+    parser.add_argument("--version", action="version", version=f"voxcaster {__version__}")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -347,6 +377,23 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # voxcaster is a persistent background service, not a terminal job: it
+    # must survive its launching shell/tty hanging up (e.g. an ad-hoc
+    # `daemon &` spawn whose parent session tears down). SIGHUP's default
+    # disposition is immediate termination with ZERO Python-visible trace —
+    # no exception, no log line. This was root-caused as the chronic
+    # "spawns then dies, falls back silently" bug: fallback.log showed 12+
+    # unexplained deaths over weeks with nothing in daemon.log to explain
+    # them; reproducing `kill -HUP <daemon pid>` against the unpatched
+    # daemon killed it instantly and silently, matching the pattern exactly.
+    # Installed here (before any slow imports/torch init) so the whole
+    # process lifetime is covered, not just the post-bind asyncio loop.
+    def _log_hangup(signum, _frame) -> None:
+        log.info("ignoring signal %d (SIGHUP) — daemon is a persistent "
+                 "service and does not exit on terminal hangup", signum)
+
+    signal.signal(signal.SIGHUP, _log_hangup)
 
     cfg = load_config(args.config)
     if args.socket:
@@ -357,6 +404,10 @@ def main(argv: list[str] | None = None) -> None:
         cfg.voice = args.voice
     if args.volume is not None:
         cfg.volume = args.volume
+    if args.markdown_preprocess is not None:
+        cfg.markdown_preprocess = args.markdown_preprocess
+    if args.always_interrupt is not None:
+        cfg.always_interrupt = args.always_interrupt
 
     if args.print_config:
         print(cfg.describe())
@@ -365,6 +416,13 @@ def main(argv: list[str] | None = None) -> None:
     lock_file = acquire_singleton_lock(cfg.lock_path)
     try:
         asyncio.run(VoiceDaemon(cfg).run())
+    except BaseException:
+        # Belt-and-suspenders: guarantee any crash (not just silent-signal
+        # deaths) leaves a full traceback in the daemon log, not just
+        # whatever asyncio/Python prints to a stderr that may or may not
+        # be captured by the spawning shell.
+        log.exception("daemon crashed")
+        raise
     finally:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_UN)

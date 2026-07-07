@@ -4,14 +4,14 @@ Precedence (lowest to highest):
 
     1. Built-in defaults (work out of the box on CPU)
     2. TOML config file
-    3. ``SPEAKD_*`` environment variables
+    3. ``VOXCASTER_*`` environment variables
     4. CLI flags (applied by the entry points)
 
 The config file is looked up in this order:
 
-    1. ``$SPEAKD_CONFIG``
-    2. ``$XDG_CONFIG_HOME/speakd/config.toml``
-       (default: ``~/.config/speakd/config.toml``)
+    1. ``$VOXCASTER_CONFIG``
+    2. ``$XDG_CONFIG_HOME/voxcaster/config.toml``
+       (default: ``~/.config/voxcaster/config.toml``)
 
 Missing files are fine — every key has a sane default.
 """
@@ -29,38 +29,49 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 VALID_DEVICE_POLICIES = ("auto", "cpu", "gpu")
 
 
+def _as_bool(value: object) -> bool:
+    """Coerce a TOML/env value to bool. Accepts native bools and the usual
+    truthy/falsy strings (1/0, true/false, yes/no, on/off)."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def default_socket_path() -> str:
-    """Per-user socket path: ``$XDG_RUNTIME_DIR/speakd.sock`` when available,
+    """Per-user socket path: ``$XDG_RUNTIME_DIR/voxcaster.sock`` when available,
     otherwise a uid-suffixed path under the system temp dir."""
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if runtime_dir and os.path.isdir(runtime_dir):
-        return os.path.join(runtime_dir, "speakd.sock")
-    return os.path.join(tempfile.gettempdir(), f"speakd-{os.getuid()}.sock")
+        return os.path.join(runtime_dir, "voxcaster.sock")
+    return os.path.join(tempfile.gettempdir(), f"voxcaster-{os.getuid()}.sock")
 
 
 def default_state_dir() -> str:
-    """``$XDG_STATE_HOME/speakd`` (default: ``~/.local/state/speakd``)."""
+    """``$XDG_STATE_HOME/voxcaster`` (default: ``~/.local/state/voxcaster``)."""
     state_home = os.environ.get(
         "XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state")
     )
-    return os.path.join(state_home, "speakd")
+    return os.path.join(state_home, "voxcaster")
 
 
 def default_config_file() -> str:
     config_home = os.environ.get(
         "XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config")
     )
-    return os.path.join(config_home, "speakd", "config.toml")
+    return os.path.join(config_home, "voxcaster", "config.toml")
 
 
 @dataclass
 class Config:
-    """Effective speakd configuration. See ``config.example.toml`` for docs."""
+    """Effective voxcaster configuration. See ``config.example.toml`` for docs."""
 
     # [tts]
     voice: str = "af_heart"  # Kokoro voice id (af_heart, bf_emma, am_adam, ...)
     speed: float = 1.0       # speech-rate multiplier
     lang_code: str = "a"     # Kokoro language code ("a" = American English)
+
+    # [tts] (cont.)
+    markdown_preprocess: bool = True  # strip markdown / extract TTS_SUMMARY before synthesis
 
     # [device]
     device: str = "auto"            # "cpu" | "gpu" | "auto" (dynamic offload)
@@ -69,6 +80,7 @@ class Config:
     # [daemon]
     socket_path: str = field(default_factory=default_socket_path)
     socket_mode: int = 0o600        # permissions applied to the socket file
+    always_interrupt: bool = False  # treat every request as an interrupt (latest-only)
     log_file: str = field(
         default_factory=lambda: os.path.join(default_state_dir(), "daemon.log")
     )
@@ -105,7 +117,7 @@ class Config:
 
     def describe(self) -> str:
         """Human-readable dump of the effective configuration."""
-        lines = [f"# effective speakd config (source: {self.source_file or 'defaults'})"]
+        lines = [f"# effective voxcaster config (source: {self.source_file or 'defaults'})"]
         for f in fields(self):
             if f.name == "source_file":
                 continue
@@ -123,10 +135,12 @@ _FILE_KEYS = [
     ("tts", "voice", "voice", str),
     ("tts", "speed", "speed", float),
     ("tts", "lang_code", "lang_code", str),
+    ("tts", "markdown_preprocess", "markdown_preprocess", _as_bool),
     ("device", "policy", "device", str),
     ("device", "keepalive_seconds", "keepalive_seconds", int),
     ("daemon", "socket_path", "socket_path", str),
     ("daemon", "socket_mode", "socket_mode", lambda v: int(str(v), 8)),
+    ("daemon", "always_interrupt", "always_interrupt", _as_bool),
     ("daemon", "log_file", "log_file", str),
     ("audio", "volume", "volume", int),
     ("audio", "max_playback_seconds", "max_playback_seconds", int),
@@ -139,27 +153,29 @@ _FILE_KEYS = [
 
 # Environment overrides for the headline knobs.
 _ENV_KEYS = [
-    ("SPEAKD_VOICE", "voice", str),
-    ("SPEAKD_SPEED", "speed", float),
-    ("SPEAKD_LANG", "lang_code", str),
-    ("SPEAKD_DEVICE", "device", str),
-    ("SPEAKD_KEEPALIVE", "keepalive_seconds", int),
-    ("SPEAKD_SOCKET", "socket_path", str),
-    ("SPEAKD_VOLUME", "volume", int),
-    ("SPEAKD_LOG_FILE", "log_file", str),
+    ("VOXCASTER_VOICE", "voice", str),
+    ("VOXCASTER_SPEED", "speed", float),
+    ("VOXCASTER_LANG", "lang_code", str),
+    ("VOXCASTER_DEVICE", "device", str),
+    ("VOXCASTER_KEEPALIVE", "keepalive_seconds", int),
+    ("VOXCASTER_SOCKET", "socket_path", str),
+    ("VOXCASTER_VOLUME", "volume", int),
+    ("VOXCASTER_LOG_FILE", "log_file", str),
+    ("VOXCASTER_MARKDOWN_PREPROCESS", "markdown_preprocess", _as_bool),
+    ("VOXCASTER_ALWAYS_INTERRUPT", "always_interrupt", _as_bool),
 ]
 
 
 def load_config(path: str | None = None) -> Config:
     """Build the effective config: defaults -> TOML file -> environment.
 
-    ``path`` (or ``$SPEAKD_CONFIG``) names an explicit TOML file; an explicit
+    ``path`` (or ``$VOXCASTER_CONFIG``) names an explicit TOML file; an explicit
     path that does not exist raises ``FileNotFoundError``. The default
     XDG-location file is optional and silently skipped when absent.
     """
     cfg = Config()
 
-    explicit = path or os.environ.get("SPEAKD_CONFIG")
+    explicit = path or os.environ.get("VOXCASTER_CONFIG")
     file = explicit or default_config_file()
     if explicit and not os.path.exists(explicit):
         raise FileNotFoundError(f"config file not found: {explicit}")

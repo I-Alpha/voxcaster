@@ -29,7 +29,7 @@ import time
 
 import numpy as np
 
-log = logging.getLogger("speakd.engine")
+log = logging.getLogger("voxcaster.engine")
 
 # Kokoro's native output sample rate; individual results may override it.
 DEFAULT_SAMPLE_RATE = 24000
@@ -93,6 +93,13 @@ class KokoroEngine:
     def on_gpu(self) -> bool:
         """Whether the model currently resides on the GPU (lock-free read)."""
         return self._on_gpu
+
+    def is_ready(self) -> bool:
+        """Whether the Kokoro pipeline has been loaded (lock-free read).
+
+        The pipeline loads lazily on the first synthesis, so this is False
+        until at least one line has been spoken."""
+        return self._pipeline is not None
 
     def idle_seconds(self) -> float:
         """Seconds since the last completed synthesis request."""
@@ -162,12 +169,16 @@ class KokoroEngine:
 
     # ── synthesis ─────────────────────────────────────────────────────────
 
-    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int]:
         """Synthesize ``text`` to a mono float waveform.
+
+        ``voice`` overrides the engine's default voice for this request only
+        (falls back to ``self.voice`` when None).
 
         Returns ``(samples, sample_rate)``. Raises :class:`SynthesisError`
         on any failure. Blocking — call from a thread executor.
         """
+        voice = voice or self.voice
         with self._lock:
             self._load_locked()
             if (self.dynamic_offload or self.always_gpu) and not self._on_gpu:
@@ -175,7 +186,7 @@ class KokoroEngine:
             try:
                 chunks: list[np.ndarray] = []
                 sample_rate = DEFAULT_SAMPLE_RATE
-                for result in self._pipeline(text, voice=self.voice, speed=self.speed):
+                for result in self._pipeline(text, voice=voice, speed=self.speed):
                     # Explicit None-checks: truth-testing a tensor raises
                     # "Boolean value of Tensor is ambiguous".
                     audio = None

@@ -1,0 +1,36 @@
+[Unit]
+Description=voxcaster TTS narration daemon
+# A fire-and-forget background service: it must outlive the shell/session
+# that started it, and must come back automatically if it ever dies
+# (signal, GPU/CUDA hiccup, OOM). SIGHUP is ignored by the daemon itself
+# (see src/voxcaster/daemon.py); this unit is the second line of defense
+# for anything that kills it outright.
+After=default.target
+
+[Service]
+Type=simple
+# Adjust the interpreter path to whichever env has `voxcaster` installed.
+ExecStart=%h/miniconda3/envs/xtts-env/bin/python -m voxcaster.daemon
+Restart=on-failure
+RestartSec=2
+# Cap restart storms (e.g. a persistently broken config) instead of
+# spinning forever.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+# Project-specific socket/voice/device overrides. Copy this file to
+# ~/.config/systemd/user/voxcaster.service and edit the Environment= lines
+# (or delete them to use voxcaster's own defaults / config.toml).
+Environment=VOXCASTER_SOCKET=/tmp/narch_voice.sock
+Environment=VOXCASTER_VOICE=bf_emma
+Environment=VOXCASTER_DEVICE=auto
+
+# Keep writing to voxcaster's own default log location (instead of only the
+# journal) so existing tooling/docs that tail ~/.local/state/voxcaster/daemon.log
+# keep working regardless of which mechanism (systemd, ensure_daemon(),
+# start_daemon.sh) launched the process.
+StandardOutput=append:%h/.local/state/voxcaster/daemon.log
+StandardError=append:%h/.local/state/voxcaster/daemon.log
+
+[Install]
+WantedBy=default.target

@@ -1,13 +1,13 @@
-"""speakd client: send text to the daemon, with auto-spawn and clean fallback.
+"""voxcaster client: send text to the daemon, with auto-spawn and clean fallback.
 
 This module is intentionally dependency-light (stdlib only) so that
-``import speakd`` and the ``speak`` CLI stay instant even on machines where
+``import voxcaster`` and the ``speak`` CLI stay instant even on machines where
 the TTS stack is heavy. The daemon's dependencies are only imported inside
 the daemon process.
 
 Python API
 ----------
-    from speakd import speak, set_volume, ensure_daemon
+    from voxcaster import speak, set_volume, ensure_daemon
 
     speak("checkpoint saved")                      # fire-and-forget
     speak("eval finished", blocking=True)          # wait until spoken
@@ -93,7 +93,7 @@ def _log_fallback(cfg: Config, reason: str) -> None:
             f.write(f"{timestamp}  FALLBACK  reason={reason}\n")
     except OSError:
         pass
-    print(f"[speakd] WARNING: fallback engine used — {reason}  (see {cfg.fallback_log})",
+    print(f"[voxcaster] WARNING: fallback engine used — {reason}  (see {cfg.fallback_log})",
           file=sys.stderr, flush=True)
 
 
@@ -120,8 +120,8 @@ def ensure_daemon(config: Config | None = None) -> bool:
     """Idempotent: make sure a daemon is listening on the configured socket.
 
     Fast path returns immediately when the socket answers. Otherwise a
-    detached daemon is spawned (``python -m speakd.daemon`` with this
-    interpreter, overridable via ``$SPEAKD_DAEMON_CMD``) and we wait up to
+    detached daemon is spawned (``python -m voxcaster.daemon`` with this
+    interpreter, overridable via ``$VOXCASTER_DAEMON_CMD``) and we wait up to
     ``client.spawn_wait`` seconds for it to come up. The daemon's flock
     singleton makes concurrent spawn attempts harmless.
     """
@@ -129,9 +129,9 @@ def ensure_daemon(config: Config | None = None) -> bool:
     if _socket_alive(cfg):
         return True
 
-    custom = os.environ.get("SPEAKD_DAEMON_CMD", "")
-    cmd = shlex.split(custom) if custom else [sys.executable, "-m", "speakd.daemon"]
-    env = dict(os.environ, SPEAKD_SOCKET=cfg.socket_path)
+    custom = os.environ.get("VOXCASTER_DAEMON_CMD", "")
+    cmd = shlex.split(custom) if custom else [sys.executable, "-m", "voxcaster.daemon"]
+    env = dict(os.environ, VOXCASTER_SOCKET=cfg.socket_path)
     try:
         os.makedirs(os.path.dirname(cfg.log_file), exist_ok=True)
         with open(cfg.log_file, "a") as log_fh:
@@ -163,15 +163,38 @@ def set_volume(level: int, config: Config | None = None) -> bool:
     cfg = _get_config(config)
     if _send(protocol.encode_volume(level), cfg):
         return True
-    print(f"[speakd] daemon not running — start it, or export SPEAKD_VOLUME={level}",
+    print(f"[voxcaster] daemon not running — start it, or export VOXCASTER_VOLUME={level}",
           file=sys.stderr)
     return False
+
+
+def ping(config: Config | None = None) -> str:
+    """Health-check the daemon.
+
+    Returns ``"ready"`` if the daemon is up and the model is loaded,
+    ``"starting"`` if it is up but the model has not loaded yet, and
+    ``"down"`` if no daemon is listening. Triggers no synthesis.
+    """
+    cfg = _get_config(config)
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(cfg.connect_timeout)
+        s.connect(cfg.socket_path)
+        s.sendall(protocol.encode_ping())
+        reply = s.recv(len(protocol.PING_STARTING) + 8)
+        s.close()
+    except OSError:
+        return "down"
+    if reply.strip() == protocol.PING_READY.strip():
+        return "ready"
+    return "starting"
 
 
 def speak(
     text: str,
     blocking: bool = False,
     interrupt: bool = False,
+    voice: str | None = None,
     config: Config | None = None,
 ) -> bool:
     """Send text to the voice daemon.
@@ -181,7 +204,9 @@ def speak(
         blocking:  Wait until the daemon has finished speaking the line.
         interrupt: Drain the pending queue and cut off in-flight playback
                    before speaking this line.
-        config:    Optional explicit :class:`speakd.config.Config`.
+        voice:     Per-request Kokoro voice id override (e.g. ``af_heart``);
+                   falls back to the daemon's configured voice when None.
+        config:    Optional explicit :class:`voxcaster.config.Config`.
 
     Returns:
         True if the line was delivered to the daemon; False if the fallback
@@ -192,7 +217,7 @@ def speak(
         return True
 
     cfg = _get_config(config)
-    wire = protocol.encode_speak(text, interrupt=interrupt)
+    wire = protocol.encode_speak(text, interrupt=interrupt, voice=voice)
 
     # Fast path — daemon already up.
     if _send(wire, cfg, wait_ack=blocking):
@@ -215,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="speak",
-        description="Send text to the speakd narration daemon.",
+        description="Send text to the voxcaster narration daemon.",
         epilog="With no TEXT arguments, text is read from stdin (pipe-friendly).",
     )
     parser.add_argument("text", nargs="*", help="text to speak")
@@ -225,14 +250,23 @@ def main(argv: list[str] | None = None) -> int:
                         help="wait until the line has been spoken")
     parser.add_argument("--volume", type=int, metavar="N",
                         help="set live playback volume (0-130) before speaking")
+    parser.add_argument("--voice", metavar="ID",
+                        help="per-request Kokoro voice id (e.g. af_heart, bf_emma)")
+    parser.add_argument("--ping", action="store_true",
+                        help="health-check the daemon and exit (prints ready/starting/down)")
     parser.add_argument("--socket", metavar="PATH", help="Unix socket path override")
     parser.add_argument("--config", metavar="PATH", help="TOML config file")
-    parser.add_argument("--version", action="version", version=f"speakd {__version__}")
+    parser.add_argument("--version", action="version", version=f"voxcaster {__version__}")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if args.socket:
         cfg.socket_path = args.socket
+
+    if args.ping:
+        status = ping(config=cfg)
+        print(status)
+        return 0 if status == "ready" else 1
 
     if args.volume is not None:
         set_volume(args.volume, config=cfg)
@@ -246,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_usage(sys.stderr)
         return 2
 
-    delivered = speak(text, blocking=args.blocking, interrupt=args.interrupt, config=cfg)
+    delivered = speak(text, blocking=args.blocking, interrupt=args.interrupt,
+                      voice=args.voice, config=cfg)
     return 0 if delivered else 1
 
 

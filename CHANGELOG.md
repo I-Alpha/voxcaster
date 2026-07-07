@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-07
+
+### Fixed
+- **Chronic post-spawn death**: the daemon had no handler for `SIGHUP` and
+  its default disposition (immediate termination) killed it silently —
+  no exception, no log line — any time its launching shell/session hung up
+  (e.g. a bare `daemon &` spawn from a script or ephemeral terminal). This
+  produced weeks of unexplained `FALLBACK reason=daemon down after spawn
+  attempt` entries in client logs with nothing in `daemon.log` to explain
+  them. `SIGHUP` is now ignored (with a log line), matching standard
+  daemon/nohup semantics — reproduced live via `kill -HUP <pid>` before and
+  after the fix.
+- Any other uncaught exception during daemon startup/run is now logged
+  with a full traceback before the process exits (previously relied on
+  whatever redirected the process's stderr, which was not always captured).
+- Completed the `speakd` → `voxcaster` rename at the git level: the
+  actually-installed/running package (`src/voxcaster/`) had never been
+  committed, while the superseded `src/speakd/` copy was still tracked —
+  a fresh clone of this repo would not have produced a working daemon.
+
+### Added
+- `packaging/systemd/voxcaster.service.example`: an optional `systemd --user`
+  unit with `Restart=on-failure` for supervised auto-restart — a second line
+  of defense against any death the daemon itself cannot prevent (OOM, CUDA
+  driver faults, `kill -9`). Verified surviving 3 consecutive `SIGKILL`s in
+  a row, restarting within ~2s each time.
+
 ## [0.2.0] - 2026-06-22
 
 ### Changed
