@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-16
+
+### Added
+- **systemd watchdog integration (`Type=notify`)**: the daemon now speaks
+  sd_notify(3) natively — stdlib-only, no `python-systemd` dependency.
+  `READY=1` is sent only once the Unix socket is actually listening (so
+  systemd never reports "active" for a daemon that can't accept a
+  connection yet), and a `WATCHDOG=1` heartbeat is pinged from *inside* the
+  asyncio event loop at half the `WatchdogSec` budget. If the loop ever
+  dies or wedges while the process stays alive — previously invisible to
+  `Restart=` supervision, which only tracks PID liveness — the heartbeat
+  stops and systemd force-restarts the unit. Guards the `WATCHDOG_PID`
+  mismatch case (pings from a PID systemd didn't arm are silently ignored
+  upstream). No-op outside systemd. Verified live: `SIGSTOP` on the daemon
+  → watchdog timeout at 30s → automatic restart → socket answering again.
+- `packaging/systemd/voxcaster.service.example` updated to match:
+  `Type=notify`, `WatchdogSec=30`, `Restart=always`, and a note on serving
+  the package-default socket plus a compat symlink for tooling that
+  hardcodes a legacy socket path.
+
+### Fixed
+- **Half-dead zombie daemons**: an unhandled crash of the event loop could
+  leave the process alive indefinitely — non-daemon executor threads
+  (torch/CUDA synthesis work) outlive the dead loop, so the interpreter
+  never exits: the socket refuses connections while `ps`/systemd still see
+  a live process holding the singleton flock. Reproduced live (a spawned
+  daemon crashed mid-synthesis on a pip PEP 668 error and lingered exactly
+  like this). The daemon now logs the full traceback and hard-exits
+  (`os._exit`), so the process dies for real and supervision restarts it.
+- **Silent worker death**: asyncio swallows task exceptions by default — a
+  worker task killed by anything its per-line guard doesn't catch left the
+  listener happily queueing lines that would never be spoken. A
+  done-callback on the worker task now converts that into a clean daemon
+  exit (and therefore a supervised restart).
+- **Orphan daemon leak on client auto-spawn**: `ensure_daemon()` now
+  prefers `systemctl --user restart voxcaster.service` when a user unit
+  exists — the respawned daemon stays tracked (journal, `Restart=` policy,
+  watchdog) and runs under the unit's own interpreter/env, instead of
+  leaking an untracked orphan bound to whatever python the client happened
+  to be running under. The raw detached spawn remains as the last resort
+  when no unit exists or the unit serves a different socket path.
+
 ## [0.2.1] - 2026-07-07
 
 ### Fixed

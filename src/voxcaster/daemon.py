@@ -43,6 +43,31 @@ log = logging.getLogger("voxcaster.daemon")
 READLINE_TIMEOUT_SEC = 5.0
 
 
+def _sd_notify(msg: str) -> None:
+    """Send one sd_notify(3) datagram to systemd, if running under it.
+
+    Stdlib-only on purpose (no python-systemd dependency): NOTIFY_SOCKET is
+    just an AF_UNIX datagram socket; a leading ``@`` means the abstract
+    namespace (swap it for a NUL byte). Silently a no-op when not under
+    systemd or on any socket error — notification must never be able to
+    take the daemon down.
+    """
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        s = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_DGRAM)
+        try:
+            s.connect(addr)
+            s.sendall(msg.encode("utf-8"))
+        finally:
+            s.close()
+    except OSError:
+        pass
+
+
 class VoiceDaemon:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -209,6 +234,39 @@ class VoiceDaemon:
                 # which a synthesis may hold — never block the event loop.
                 await loop.run_in_executor(None, self.engine.maybe_offload)
 
+    async def _watchdog_heartbeat(self) -> None:
+        """Ping systemd's watchdog from INSIDE the event loop.
+
+        ``Type=notify`` + ``WatchdogSec=`` in the unit make systemd expect a
+        ``WATCHDOG=1`` datagram at least every WatchdogSec. Sending it from a
+        loop task means the heartbeat stops the moment the event loop dies —
+        an unhandled crash or a wedged loop — even though the process itself
+        is still alive. That is exactly the failure mode where systemd shows
+        ``Active: running`` while connect() gets ECONNREFUSED: without a
+        watchdog systemd trusts the live PID forever; with one it aborts and
+        restarts the unit as soon as the pings stop.
+
+        No-op outside systemd (no WATCHDOG_USEC) and when the watchdog was
+        armed for a different PID (WATCHDOG_PID mismatch, e.g. a manually
+        forked child).
+        """
+        usec = os.environ.get("WATCHDOG_USEC")
+        wd_pid = os.environ.get("WATCHDOG_PID")
+        if not usec or (wd_pid and wd_pid != str(os.getpid())):
+            return
+        try:
+            # Ping at half the budget — the interval systemd itself documents.
+            interval = max(1.0, int(usec) / 2_000_000)
+        except ValueError:
+            return
+        while not self._stop.is_set():
+            _sd_notify("WATCHDOG=1")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                break  # stop requested
+            except asyncio.TimeoutError:
+                pass
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             data = await asyncio.wait_for(reader.readline(), timeout=READLINE_TIMEOUT_SEC)
@@ -291,6 +349,11 @@ class VoiceDaemon:
         os.chmod(self.cfg.socket_path, self.cfg.socket_mode)
         log.info("voxcaster %s ready  voice=%s  socket=%s",
                  __version__, self.cfg.voice, self.cfg.socket_path)
+        # Under Type=notify, systemd holds the unit in "activating" until
+        # this arrives — sent only now, with the socket actually listening,
+        # so "active (running)" is never claimed for a daemon that can't
+        # yet accept a connection.
+        _sd_notify("READY=1")
 
         def _shutdown(sig: int) -> None:
             log.info("shutdown (signal %d)", sig)
@@ -302,11 +365,32 @@ class VoiceDaemon:
 
         worker_task = asyncio.create_task(self._worker(loop))
         offload_task = asyncio.create_task(self._idle_offload(loop))
+        watchdog_task = asyncio.create_task(self._watchdog_heartbeat())
+
+        # asyncio swallows task exceptions by default (surfacing them only
+        # as a GC-time "exception was never retrieved" warning) — a worker
+        # killed by anything its per-line guard doesn't catch would leave
+        # the listener happily queueing lines that never get spoken, with
+        # the loop (and therefore the watchdog heartbeat) still healthy.
+        # Convert that silent death into a clean daemon exit instead;
+        # systemd's Restart= policy brings back a working instance.
+        def _core_task_died(task: asyncio.Task) -> None:
+            if task.cancelled() or self._stop.is_set():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.error("core task died: %r — stopping daemon so the "
+                          "supervisor can restart it", exc)
+                self._stop.set()
+                server.close()
+
+        worker_task.add_done_callback(_core_task_died)
 
         async with server:
             await self._stop.wait()
 
-        for task in (worker_task, offload_task):
+        _sd_notify("STOPPING=1")
+        for task in (worker_task, offload_task, watchdog_task):
             task.cancel()
             try:
                 await task
@@ -416,13 +500,29 @@ def main(argv: list[str] | None = None) -> None:
     lock_file = acquire_singleton_lock(cfg.lock_path)
     try:
         asyncio.run(VoiceDaemon(cfg).run())
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException:
         # Belt-and-suspenders: guarantee any crash (not just silent-signal
-        # deaths) leaves a full traceback in the daemon log, not just
-        # whatever asyncio/Python prints to a stderr that may or may not
-        # be captured by the spawning shell.
-        log.exception("daemon crashed")
-        raise
+        # deaths) leaves a full traceback in the daemon log — then take the
+        # process down HARD. A plain `raise` here can leave a half-dead
+        # zombie: non-daemon executor threads (torch/CUDA synthesis work
+        # scheduled via run_in_executor) outlive the dead event loop, so the
+        # interpreter never exits — the socket refuses connections while
+        # `ps`/systemd still see a live process holding the flock (observed
+        # live 2026-07-16: a spawned daemon crashed mid-synthesis on a pip
+        # PEP 668 error and lingered exactly like this). os._exit() skips
+        # the thread joins; the process dies for real and systemd's
+        # Restart= policy brings a fresh one back.
+        log.exception("daemon crashed — hard exit so no half-dead process lingers")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+            os.unlink(cfg.lock_path)
+        except OSError:
+            pass
+        logging.shutdown()
+        os._exit(70)  # EX_SOFTWARE; unreachable by the finally below
     finally:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_UN)

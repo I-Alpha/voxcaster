@@ -116,18 +116,58 @@ def _fallback_speak(text: str, interrupt: bool, cfg: Config) -> None:
 
 # ── public API ──────────────────────────────────────────────────────────────
 
+_SYSTEMD_UNIT = "voxcaster.service"
+
+
+def _systemd_unit_available() -> bool:
+    """True when a user-level voxcaster unit exists and systemd is reachable."""
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", "cat", _SYSTEMD_UNIT],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def ensure_daemon(config: Config | None = None) -> bool:
     """Idempotent: make sure a daemon is listening on the configured socket.
 
-    Fast path returns immediately when the socket answers. Otherwise a
-    detached daemon is spawned (``python -m voxcaster.daemon`` with this
-    interpreter, overridable via ``$VOXCASTER_DAEMON_CMD``) and we wait up to
-    ``client.spawn_wait`` seconds for it to come up. The daemon's flock
-    singleton makes concurrent spawn attempts harmless.
+    Fast path returns immediately when the socket answers. When a systemd
+    user unit exists, recovery goes through ``systemctl --user restart``
+    FIRST: the respawned daemon stays tracked (journal, Restart= policy,
+    watchdog) and runs under the unit's own interpreter/env — instead of
+    leaking an untracked orphan bound to whatever python the client happens
+    to be running under (root cause of the orphan-daemon leak observed
+    2026-07-16: every fresh session raw-spawned a /usr/bin/python daemon
+    that later crashed into a half-dead zombie). Only if there is no unit —
+    or the unit came up but never produced THIS socket (e.g. it is
+    configured for a different socket_path) — does the raw detached spawn
+    (``python -m voxcaster.daemon``, overridable via ``$VOXCASTER_DAEMON_CMD``)
+    run as the last resort, waiting up to ``client.spawn_wait`` seconds. The
+    daemon's flock singleton makes concurrent spawn attempts harmless.
     """
     cfg = _get_config(config)
     if _socket_alive(cfg):
         return True
+
+    if _systemd_unit_available():
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "restart", _SYSTEMD_UNIT],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        # The managed daemon pays the full torch/Kokoro import cost before
+        # its socket opens (~5-6s on this class of machine), so give it a
+        # floor above the snappier raw-spawn budget.
+        deadline = time.monotonic() + max(cfg.spawn_wait, 10.0)
+        while time.monotonic() < deadline:
+            if _socket_alive(cfg):
+                return True
+            time.sleep(0.2)
+        # Unit exists but never answered on cfg.socket_path — fall through.
 
     custom = os.environ.get("VOXCASTER_DAEMON_CMD", "")
     cmd = shlex.split(custom) if custom else [sys.executable, "-m", "voxcaster.daemon"]

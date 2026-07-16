@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxcaster"
-version = "0.2.1"
+version = "0.3.0"
 description = "Local text-to-speech daemon and CLI for speech notifications from scripts, builds, cron jobs, and ML training runs, powered by Kokoro TTS with GPU offload and espeak fallback."
 readme = "README.md"
 license = { text = "MIT" }

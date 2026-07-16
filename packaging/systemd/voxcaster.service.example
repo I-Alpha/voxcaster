@@ -8,21 +8,34 @@ Description=voxcaster TTS narration daemon
 After=default.target
 
 [Service]
-Type=simple
-# Adjust the interpreter path to whichever env has `voxcaster` installed.
-ExecStart=%h/miniconda3/envs/xtts-env/bin/python -m voxcaster.daemon
-Restart=on-failure
+# Type=notify + WatchdogSec: the daemon sends READY=1 only once its socket
+# is actually listening, then pings WATCHDOG=1 from INSIDE its asyncio loop
+# (src/voxcaster/daemon.py _watchdog_heartbeat). If the loop ever dies or
+# wedges while the process stays alive, the pings stop and systemd
+# force-restarts the unit instead of trusting the live PID forever.
+Type=notify
+WatchdogSec=30
+# Adjust the interpreter path to whichever env has `voxcaster` installed
+# (e.g. a conda env's or virtualenv's bin/python).
+ExecStart=/usr/bin/python3 -m voxcaster.daemon
+Restart=always
 RestartSec=2
 # Cap restart storms (e.g. a persistently broken config) instead of
 # spinning forever.
 StartLimitIntervalSec=120
 StartLimitBurst=10
 
-# Project-specific socket/voice/device overrides. Copy this file to
+# Voice/device overrides. Copy this file to
 # ~/.config/systemd/user/voxcaster.service and edit the Environment= lines
 # (or delete them to use voxcaster's own defaults / config.toml).
-Environment=VOXCASTER_SOCKET=/tmp/narch_voice.sock
-Environment=VOXCASTER_VOICE=bf_emma
+#
+# Prefer leaving VOXCASTER_SOCKET unset: serving the package-default socket
+# (%t/voxcaster.sock) means every default-config `speak` client reaches this
+# managed daemon, and ensure_daemon() restarts THIS unit on recovery instead
+# of spawning an untracked daemon. If older tooling hardcodes a legacy
+# socket path, keep it answering with a compat symlink, e.g.:
+#   ExecStartPost=/bin/ln -sfn %t/voxcaster.sock /tmp/my_legacy.sock
+Environment=VOXCASTER_VOICE=af_heart
 Environment=VOXCASTER_DEVICE=auto
 
 # Keep writing to voxcaster's own default log location (instead of only the
