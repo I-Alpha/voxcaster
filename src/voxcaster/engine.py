@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -169,6 +170,56 @@ class KokoroEngine:
 
     # ── synthesis ─────────────────────────────────────────────────────────
 
+    # 2026-07-30: Kokoro's KPipeline splits input with split_pattern=r'\n+',
+    # i.e. on NEWLINES ONLY. A long single-paragraph line therefore reaches the
+    # model as ONE chunk and is silently truncated at the model's token limit —
+    # the caller gets a clean exit, the daemon logs "spoke", and the listener
+    # hears the first ~30 seconds of a two-minute report with no error anywhere.
+    # Observed live: multi-paragraph status narrations cut off mid-sentence.
+    #
+    # The playback path was already written to refuse a fixed ceiling (see
+    # daemon._speak's max_playback_seconds comment); this closes the same hole
+    # on the SYNTHESIS side, which is where the loss actually happened.
+    #
+    # Fix by inserting newlines the pipeline will split on: break into
+    # sentences, then greedily pack them into chunks under a conservative
+    # character budget. Packing rather than one-sentence-per-chunk keeps
+    # prosody natural — sentence-at-a-time synthesis sounds clipped.
+    _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+')
+    _CHUNK_BUDGET_CHARS = 320
+
+    @classmethod
+    def _chunk_for_pipeline(cls, text: str) -> str:
+        """Insert newlines so KPipeline chunks long text instead of truncating.
+
+        Existing newlines are preserved as hard breaks (the caller may have
+        meant them). Each resulting paragraph is packed into <=
+        _CHUNK_BUDGET_CHARS pieces on sentence boundaries. A single sentence
+        longer than the budget is left intact rather than cut mid-clause — a
+        very long clause is a caller problem, and truncating it here would
+        reintroduce exactly the silent loss this exists to prevent.
+        """
+        out: list[str] = []
+        for para in text.split('\n'):
+            para = para.strip()
+            if not para:
+                continue
+            if len(para) <= cls._CHUNK_BUDGET_CHARS:
+                out.append(para)
+                continue
+            cur = ''
+            for sent in cls._SENTENCE_SPLIT.split(para):
+                if not sent:
+                    continue
+                if cur and len(cur) + 1 + len(sent) > cls._CHUNK_BUDGET_CHARS:
+                    out.append(cur)
+                    cur = sent
+                else:
+                    cur = f'{cur} {sent}' if cur else sent
+            if cur:
+                out.append(cur)
+        return '\n'.join(out)
+
     def synthesize(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int]:
         """Synthesize ``text`` to a mono float waveform.
 
@@ -183,10 +234,26 @@ class KokoroEngine:
             self._load_locked()
             if (self.dynamic_offload or self.always_gpu) and not self._on_gpu:
                 self._to_gpu_locked()  # failure is logged; CPU synthesis continues
+            # Voice lang_code switching: Kokoro's KPipeline is created with
+            # a fixed lang_code ('a'=American, 'b'=British). When the requested
+            # voice has a different first-letter lang_code than the current
+            # pipeline, we must recreate the pipeline with the new lang_code.
+            # Without this, switching from bf_emma (British) to am_michael
+            # (American) speaks with the wrong accent/phoneme model.
+            new_lang = voice[0] if voice and voice[0] in ('a', 'b') else 'a'
+            if new_lang != self.lang_code:
+                log.info("voice lang_code changed %s->%s (voice=%s)",
+                         self.lang_code, new_lang, voice)
+                from kokoro import KPipeline
+                self._pipeline = KPipeline(lang_code=new_lang, device="cpu")
+                self.lang_code = new_lang
+                self._on_gpu = False
+
             try:
                 chunks: list[np.ndarray] = []
                 sample_rate = DEFAULT_SAMPLE_RATE
-                for result in self._pipeline(text, voice=voice, speed=self.speed):
+                chunked = self._chunk_for_pipeline(text)
+                for result in self._pipeline(chunked, voice=voice, speed=self.speed):
                     # Explicit None-checks: truth-testing a tensor raises
                     # "Boolean value of Tensor is ambiguous".
                     audio = None
