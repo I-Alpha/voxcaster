@@ -81,13 +81,16 @@ class Config:
     socket_path: str = field(default_factory=default_socket_path)
     socket_mode: int = 0o600        # permissions applied to the socket file
     always_interrupt: bool = False  # treat every request as an interrupt (latest-only)
+    max_message_bytes: int = 16 * 1024 * 1024  # longest single request line accepted
     log_file: str = field(
         default_factory=lambda: os.path.join(default_state_dir(), "daemon.log")
     )
 
     # [audio]
     volume: int = 100                    # playback volume, 0-130 (mpv scale)
-    max_playback_seconds: int = 120      # kill the player after this long
+    max_playback_seconds: int = 120      # hang-protection floor; real clips that run
+                                          # longer than this get their own actual
+                                          # duration + margin instead of being cut off
     player: list[str] = field(
         default_factory=lambda: ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
     )
@@ -141,6 +144,7 @@ _FILE_KEYS = [
     ("daemon", "socket_path", "socket_path", str),
     ("daemon", "socket_mode", "socket_mode", lambda v: int(str(v), 8)),
     ("daemon", "always_interrupt", "always_interrupt", _as_bool),
+    ("daemon", "max_message_bytes", "max_message_bytes", int),
     ("daemon", "log_file", "log_file", str),
     ("audio", "volume", "volume", int),
     ("audio", "max_playback_seconds", "max_playback_seconds", int),
@@ -163,6 +167,7 @@ _ENV_KEYS = [
     ("VOXCASTER_LOG_FILE", "log_file", str),
     ("VOXCASTER_MARKDOWN_PREPROCESS", "markdown_preprocess", _as_bool),
     ("VOXCASTER_ALWAYS_INTERRUPT", "always_interrupt", _as_bool),
+    ("VOXCASTER_MAX_MESSAGE_BYTES", "max_message_bytes", int),
 ]
 
 

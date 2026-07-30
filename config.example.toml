@@ -1,8 +1,8 @@
 # voxcaster configuration
 #
-# Copy to ~/.config/voxcaster/config.toml (or point $SPEAKD_CONFIG at it).
+# Copy to ~/.config/voxcaster/config.toml (or point $VOXCASTER_CONFIG at it).
 # Every key is optional — the built-in defaults work out of the box on CPU.
-# Environment variables (SPEAKD_*) override anything set here.
+# Environment variables (VOXCASTER_*) override anything set here.
 
 [tts]
 # Kokoro voice id. A few favourites:
@@ -46,6 +46,13 @@ socket_mode = "600"
 # for Claude Code hooks where stale lines aren't worth hearing. Default: false.
 always_interrupt = false
 
+# Longest single request line the daemon will accept, in bytes. This is a real
+# ceiling on asyncio's read buffer, not advisory — anything longer than it
+# fails to parse silently (the connection just closes with no ack). Set this
+# above the longest single message you'll ever send in one call — e.g. a
+# whole book pasted in one `speak` invocation. Default: 16 MiB.
+max_message_bytes = 16777216
+
 # Where an auto-spawned daemon writes its log.
 # Default: ~/.local/state/voxcaster/daemon.log
 #log_file = "/home/me/.local/state/voxcaster/daemon.log"
@@ -54,7 +61,10 @@ always_interrupt = false
 # Playback volume 0-130 (mpv scale; 100 = nominal, >100 = software gain).
 volume = 100
 
-# Kill playback of a single line after this many seconds (safety net).
+# Hang-protection FLOOR, not a cap on legitimate long content: a clip whose
+# real duration exceeds this gets its own duration + margin as the actual
+# timeout, so a long ("book"-length) message is never cut off mid-playback —
+# this value only guarantees a minimum kill-timeout for short/silent hangs.
 max_playback_seconds = 120
 
 # Audio player argv template. "{file}" is the wav path, "{volume}" the

@@ -123,8 +123,17 @@ class VoiceDaemon:
             # Track the player so an interrupt can kill it mid-line.
             with self._player_lock:
                 self._current_player = proc
+            # cfg.max_playback_seconds is a HANG-PROTECTION FLOOR, not a cap on
+            # legitimate content: a fixed ceiling here would silently kill
+            # mid-playback the moment a long ("book"-length) line's audio
+            # outran it. The real timeout is however long this clip actually
+            # runs, plus headroom for player startup/seek overhead; the config
+            # value only sets a minimum so short clips still get hang
+            # protection even when duration is ~0.
+            duration_seconds = len(wav) / sample_rate if sample_rate else 0.0
+            timeout = max(self.cfg.max_playback_seconds, duration_seconds + 30.0)
             try:
-                proc.wait(timeout=self.cfg.max_playback_seconds)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
@@ -304,6 +313,12 @@ class VoiceDaemon:
                 voice, _, text = rest.partition("\x03")
                 voice = voice or None
 
+            # Restore literal newlines the client escaped to survive the
+            # line-oriented framing. Must run AFTER marker stripping (markers
+            # are matched against the raw wire text) and BEFORE markdown
+            # preprocessing (which is line-structure aware).
+            text = protocol.unescape_newlines(text)
+
             if self.cfg.markdown_preprocess:
                 from .markdown import preprocess_for_speech
                 text = preprocess_for_speech(text).strip()
@@ -345,7 +360,15 @@ class VoiceDaemon:
         loop = asyncio.get_running_loop()
 
         self._remove_stale_socket()
-        server = await asyncio.start_unix_server(self._handle, path=self.cfg.socket_path)
+        # `limit` bounds asyncio's internal StreamReader buffer, not just an
+        # advisory: the stdlib default (64 KiB) makes readline() raise
+        # LimitOverrunError on anything longer, which the broad except in
+        # _handle() swallows silently — a long paste (a "book") would just
+        # vanish with no ack and no log line. cfg.max_message_bytes must cover
+        # the longest single utterance a caller will ever send in one line.
+        server = await asyncio.start_unix_server(
+            self._handle, path=self.cfg.socket_path, limit=self.cfg.max_message_bytes
+        )
         os.chmod(self.cfg.socket_path, self.cfg.socket_mode)
         log.info("voxcaster %s ready  voice=%s  socket=%s",
                  __version__, self.cfg.voice, self.cfg.socket_path)
