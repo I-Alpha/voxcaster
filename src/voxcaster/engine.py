@@ -63,8 +63,22 @@ class KokoroEngine:
         # and the idle-offload path also runs in an executor, never on the
         # asyncio event loop itself.
         self._lock = threading.Lock()
-        self._pipeline = None
-        self._on_gpu = False
+        # lang_code -> KPipeline. A KPipeline is bound to one lang_code at
+        # construction, and a per-request voice can be from either family, so a
+        # single slot means every cross-family voice swap is a full rebuild.
+        # ⊨ MEASURED 2026-07-30: rebuild costs 2807ms (lang a) / 2320ms (lang b),
+        #   and daemon.log recorded 167 `voice lang_code changed` events, i.e.
+        #   ~428s of pure reconstruction, plus a forced CPU->GPU move each time
+        #   because the rebuild reset the device flag. Worse than the cost: a
+        #   report ends up delivered in alternating voices AND accents
+        #   (American af_heart vs British bf_emma), which is what "the voice
+        #   sounds robotic" actually was. Per-clip logs all reported success
+        #   with a plausible duration, so it was invisible.
+        # Bounded by construction: _lang_for_voice only ever returns 'a' or 'b',
+        # so the cache holds at most 2 Kokoro-82M models (~660MB fp32 total).
+        self._pipelines: dict[str, object] = {}
+        # lang_codes whose model currently sits on the GPU (holding VRAM).
+        self._gpu_langs: set[str] = set()
         self._last_used = 0.0  # time.monotonic() of the last completed request
 
         if policy == "cpu":
@@ -90,64 +104,104 @@ class KokoroEngine:
         except Exception:
             return False
 
+    @staticmethod
+    def _lang_for_voice(voice: str | None) -> str:
+        """Kokoro lang_code implied by a voice id ('a'=American, 'b'=British).
+
+        Voice ids are ``<lang><gender>_<name>`` (af_heart, bm_george). Anything
+        unrecognised falls back to 'a', which is also what the pipeline default
+        would have been.
+        """
+        return voice[0] if voice and voice[0] in ("a", "b") else "a"
+
     @property
     def on_gpu(self) -> bool:
-        """Whether the model currently resides on the GPU (lock-free read)."""
-        return self._on_gpu
+        """Whether ANY cached model currently holds VRAM (lock-free read).
+
+        'Any', not 'the active one': the idle-offload timer uses this to decide
+        whether there is VRAM to reclaim, and a warm-but-inactive pipeline on
+        the GPU is exactly as much VRAM as an active one.
+        """
+        return bool(self._gpu_langs)
 
     def is_ready(self) -> bool:
-        """Whether the Kokoro pipeline has been loaded (lock-free read).
+        """Whether at least one Kokoro pipeline has been loaded (lock-free read).
 
-        The pipeline loads lazily on the first synthesis, so this is False
-        until at least one line has been spoken."""
-        return self._pipeline is not None
+        Pipelines load lazily on first use, so this is False until at least one
+        line has been spoken."""
+        return bool(self._pipelines)
 
     def idle_seconds(self) -> float:
         """Seconds since the last completed synthesis request."""
         return time.monotonic() - self._last_used
 
-    def _load_locked(self) -> None:
-        """Load the Kokoro pipeline onto the CPU. Idempotent. Lock must be held."""
-        if self._pipeline is not None:
-            return
+    def _pipeline_locked(self, lang: str):
+        """Cached KPipeline for ``lang``, constructing it once. Lock must be held.
+
+        This is the whole point of the cache: a cross-family voice swap must be
+        a dict lookup, not a 2.3-2.8s reconstruction that also drops the model
+        back to the CPU.
+        """
+        pipe = self._pipelines.get(lang)
+        if pipe is not None:
+            return pipe
         try:
             from kokoro import KPipeline
-            # Always load onto CPU — moved to GPU per-request by policy.
-            self._pipeline = KPipeline(lang_code=self.lang_code, device="cpu")
+            # Always construct on CPU — moved to GPU per-request by policy.
+            pipe = KPipeline(lang_code=lang, device="cpu")
         except Exception as e:
-            raise SynthesisError(f"failed to load Kokoro pipeline: {e}") from e
-        self._on_gpu = False
-        log.info("Kokoro pipeline loaded on CPU (voice=%s)", self.voice)
+            raise SynthesisError(
+                f"failed to load Kokoro pipeline (lang_code={lang!r}): {e}") from e
+        self._pipelines[lang] = pipe
+        log.info("Kokoro pipeline constructed for lang_code=%r on CPU; cache now %s",
+                 lang, sorted(self._pipelines))
+        return pipe
 
-    def _to_gpu_locked(self) -> bool:
-        """Move the model to the GPU. Returns False on OOM/unavailable.
+    def _to_gpu_locked(self, lang: str) -> bool:
+        """Move ``lang``'s model to the GPU. False on OOM/unavailable.
         Lock must be held."""
-        if self._on_gpu:
+        if lang in self._gpu_langs:
             return True
-        if not self.gpu_available or self._pipeline is None or self._pipeline.model is None:
+        pipe = self._pipelines.get(lang)
+        if not self.gpu_available or pipe is None or pipe.model is None:
             return False
         try:
-            self._pipeline.model.to("cuda")
-            self._on_gpu = True
-            log.info("model moved to GPU")
+            pipe.model.to("cuda")
+            self._gpu_langs.add(lang)
+            log.info("model moved to GPU (lang_code=%r; on GPU: %s)",
+                     lang, sorted(self._gpu_langs))
             return True
         except RuntimeError as e:
             # OOM or similar — stay on CPU for this request.
-            log.warning("model.to('cuda') failed (OOM?) — staying on CPU: %s", e)
+            log.warning("model.to('cuda') failed for lang_code=%r (OOM?) — "
+                        "staying on CPU: %s", lang, e)
             return False
 
     def _to_cpu_locked(self) -> None:
-        """Move the model to the CPU and release VRAM. Lock must be held."""
-        if not self._on_gpu or self._pipeline is None or self._pipeline.model is None:
-            return
-        try:
-            import torch
-            self._pipeline.model.to("cpu")
-            torch.cuda.empty_cache()
-            self._on_gpu = False
-            log.info("model offloaded to CPU; VRAM released")
-        except Exception as e:
-            log.warning("model.to('cpu') failed: %s", e)
+        """Move EVERY cached model to the CPU and release VRAM. Lock must be held.
+
+        All of them: offloading only the active pipeline would leave a warm
+        inactive one pinning VRAM that the offload exists to reclaim.
+        """
+        moved = []
+        for lang in sorted(self._gpu_langs):
+            pipe = self._pipelines.get(lang)
+            if pipe is None or pipe.model is None:
+                continue
+            try:
+                pipe.model.to("cpu")
+                moved.append(lang)
+            except Exception as e:
+                log.warning("model.to('cpu') failed for lang_code=%r: %s", lang, e)
+        for lang in moved:
+            self._gpu_langs.discard(lang)
+        if moved:
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception as e:
+                log.warning("torch.cuda.empty_cache() failed: %s", e)
+            log.info("models offloaded to CPU; VRAM released (lang_codes=%s)", moved)
 
     def maybe_offload(self) -> bool:
         """Offload the model to the CPU if it has been idle for at least
@@ -158,33 +212,50 @@ class KokoroEngine:
         if not self.dynamic_offload:
             return False
         with self._lock:
-            if not self._on_gpu:
+            if not self._gpu_langs:
                 return False
             idle = time.monotonic() - self._last_used
             if idle < self.keepalive_seconds:
                 return False
-            log.info("idle %.0fs >= %ds keepalive — offloading model to CPU",
+            log.info("idle %.0fs >= %ds keepalive — offloading model(s) to CPU",
                      idle, self.keepalive_seconds)
             self._to_cpu_locked()
-            return not self._on_gpu
+            return not self._gpu_langs
 
     # ── synthesis ─────────────────────────────────────────────────────────
 
-    # 2026-07-30: Kokoro's KPipeline splits input with split_pattern=r'\n+',
-    # i.e. on NEWLINES ONLY. A long single-paragraph line therefore reaches the
-    # model as ONE chunk and is silently truncated at the model's token limit —
-    # the caller gets a clean exit, the daemon logs "spoke", and the listener
-    # hears the first ~30 seconds of a two-minute report with no error anywhere.
-    # Observed live: multi-paragraph status narrations cut off mid-sentence.
+    # PROSODY / DEFENCE-IN-DEPTH ONLY. This is NOT a truncation fix.
     #
-    # The playback path was already written to refuse a fixed ceiling (see
-    # daemon._speak's max_playback_seconds comment); this closes the same hole
-    # on the SYNTHESIS side, which is where the loss actually happened.
+    # It was introduced on the theory that KPipeline's split_pattern=r'\n+'
+    # (newlines only) made a long single-paragraph line arrive as ONE chunk and
+    # get truncated at the model's token limit. That theory is FALSIFIED.
     #
-    # Fix by inserting newlines the pipeline will split on: break into
-    # sentences, then greedily pack them into chunks under a conservative
-    # character budget. Packing rather than one-sentence-per-chunk keeps
-    # prosody natural — sentence-at-a-time synthesis sounds clipped.
+    # ⊨ MEASURED 2026-07-30, controlled two-arm, 2531-char newline-free input,
+    #   identical except for this function:
+    #     without chunking: 139.2s of audio @ 24000Hz (18.2 chars/sec)
+    #     with    chunking: 147.4s of audio @ 24000Hz (17.2 chars/sec)
+    #   ratio 1.06x. Both durations are full-length for the input, so nothing
+    #   was ever being lost here. Corroborated by daemon.log, which shows
+    #   pre-fix clips of 171.8s / 126.7s / 91.2s all completing with rc=0.
+    #
+    # ■ MECHANISM (kokoro/pipeline.py:195-220): split_pattern only builds the
+    #   OUTER graphemes. Each grapheme is then sub-batched internally by
+    #   KPipeline.en_tokenize at a 510-phoneme boundary, and every batch is
+    #   yielded as its own Result — which synthesize() below concatenates. The
+    #   only real truncation in Kokoro (pipeline.py:275-278, "Unexpected
+    #   len(ps) ... Truncating to 510") is reachable from
+    #   generate_from_tokens(), never from __call__().
+    #
+    # The actual silent loss was elsewhere and is fixed elsewhere: the wire
+    # protocol cut every payload at its first newline (see protocol.py's
+    # "Newlines inside the payload" — measured 61% loss on a 3-paragraph line),
+    # and tools/voice/speak_last_response.py truncated spans at 320 chars.
+    #
+    # Kept, not reverted, for two reasons that do not depend on the false
+    # theory: it makes chunk boundaries deterministic and sentence-aligned
+    # rather than phoneme-count-aligned (audibly better breaks), and it holds
+    # the line if a future kokoro drops the internal 510-phoneme batching.
+    # Its cost is the +6% duration above, from inter-chunk silence.
     _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+')
     _CHUNK_BUDGET_CHARS = 320
 
@@ -230,30 +301,38 @@ class KokoroEngine:
         on any failure. Blocking — call from a thread executor.
         """
         voice = voice or self.voice
+        # CROSS-CALLER CONTENTION GUARD. One daemon serves every caller on the
+        # box, and each request may carry its own voice. When callers disagree,
+        # consecutive lines of what the listener experiences as one report come
+        # out in different voices and different accents. That is not visible in
+        # any per-clip log line — each clip reports success with a plausible
+        # duration — so make the disagreement itself loud.
+        if voice != self.voice:
+            log.warning("[voice-contention] request voice=%r != configured default=%r "
+                        "— consecutive lines will not match; if this alternates, a "
+                        "shared listener hears one report in several speakers",
+                        voice, self.voice)
+        lang = self._lang_for_voice(voice)
         with self._lock:
-            self._load_locked()
-            if (self.dynamic_offload or self.always_gpu) and not self._on_gpu:
-                self._to_gpu_locked()  # failure is logged; CPU synthesis continues
-            # Voice lang_code switching: Kokoro's KPipeline is created with
-            # a fixed lang_code ('a'=American, 'b'=British). When the requested
-            # voice has a different first-letter lang_code than the current
-            # pipeline, we must recreate the pipeline with the new lang_code.
-            # Without this, switching from bf_emma (British) to am_michael
-            # (American) speaks with the wrong accent/phoneme model.
-            new_lang = voice[0] if voice and voice[0] in ('a', 'b') else 'a'
-            if new_lang != self.lang_code:
-                log.info("voice lang_code changed %s->%s (voice=%s)",
-                         self.lang_code, new_lang, voice)
-                from kokoro import KPipeline
-                self._pipeline = KPipeline(lang_code=new_lang, device="cpu")
-                self.lang_code = new_lang
-                self._on_gpu = False
+            # Voice lang_code switching: a KPipeline is bound to one lang_code
+            # ('a'=American, 'b'=British) at construction, so a voice from the
+            # other family needs that family's pipeline — otherwise the line is
+            # spoken with the wrong accent/phoneme model. Previously this
+            # RECONSTRUCTED the pipeline every swap; now it is a cache lookup.
+            if lang != self.lang_code:
+                log.info("active lang_code %s->%s (voice=%s) — %s",
+                         self.lang_code, lang, voice,
+                         "cache hit" if lang in self._pipelines else "first use, constructing")
+                self.lang_code = lang
+            pipeline = self._pipeline_locked(lang)
+            if (self.dynamic_offload or self.always_gpu) and lang not in self._gpu_langs:
+                self._to_gpu_locked(lang)  # failure is logged; CPU synthesis continues
 
             try:
                 chunks: list[np.ndarray] = []
                 sample_rate = DEFAULT_SAMPLE_RATE
                 chunked = self._chunk_for_pipeline(text)
-                for result in self._pipeline(chunked, voice=voice, speed=self.speed):
+                for result in pipeline(chunked, voice=voice, speed=self.speed):
                     # Explicit None-checks: truth-testing a tensor raises
                     # "Boolean value of Tensor is ambiguous".
                     audio = None

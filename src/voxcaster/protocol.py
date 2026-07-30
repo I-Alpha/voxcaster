@@ -18,6 +18,20 @@ escaping is needed and any language with a Unix-socket API can be a client.
 
 The daemon replies ``b"OK\\n"`` once a speak line has been spoken. Fire-and-forget
 clients simply close the connection without reading the ack.
+
+Newlines inside the payload
+---------------------------
+The framing is one ``\\n``-terminated line per request, so a literal newline in
+the text WOULD end the request early: the daemon's ``readline()`` returns only
+the first line and the remainder is discarded when the connection closes — with
+an ACK still sent and exit status 0, i.e. silent loss. Measured 2026-07-30: a
+168-char three-paragraph payload arrived as 65 chars (61% destroyed), which is
+what "the listener only hears the first paragraph" actually was.
+
+So ``encode_speak`` maps literal newlines to :data:`NEWLINE_ESCAPE` (RS, record
+separator) and the daemon maps them back before synthesis. RS is used for the
+same reason as the marker control characters above: it cannot occur in normal
+UTF-8 speech text, so no further escaping is needed.
 """
 from __future__ import annotations
 
@@ -25,6 +39,7 @@ INTERRUPT_MARKER = "\x01INTERRUPT\x01"  # SOH-flanked - never in UTF-8 speech te
 VOLUME_MARKER = "\x02VOLUME\x02"        # STX-flanked - likewise
 VOICE_MARKER = "\x03VOICE\x03"          # ETX-flanked per-request voice override
 PING_MARKER = "\x04PING\x04"            # EOT-flanked health check
+NEWLINE_ESCAPE = "\x1e"                 # RS - stands in for a literal newline
 ACK = b"OK\n"
 PING_READY = b"READY\n"                 # daemon reply: model loaded
 PING_STARTING = b"STARTING\n"           # daemon reply: model not loaded yet
@@ -38,14 +53,32 @@ def clamp_volume(level: int) -> int:
     return max(VOLUME_MIN, min(VOLUME_MAX, int(level)))
 
 
+def escape_newlines(text: str) -> str:
+    """Make ``text`` safe to carry inside one newline-terminated request line.
+
+    CR and CRLF are normalised to LF first so a Windows-style payload does not
+    survive as a stray carriage return in the spoken text.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", NEWLINE_ESCAPE)
+
+
+def unescape_newlines(text: str) -> str:
+    """Restore the literal newlines that :func:`escape_newlines` stood in for."""
+    return text.replace(NEWLINE_ESCAPE, "\n")
+
+
 def encode_speak(text: str, interrupt: bool = False, voice: str | None = None) -> bytes:
     """Encode a speak request (optionally interrupt-and-speak, optional voice).
 
     The voice prefix is applied to the text payload, so it sits inside the
     interrupt prefix when both are present: the daemon strips interrupt first,
     then voice, then is left with the bare text.
+
+    Literal newlines in ``text`` are escaped (see :func:`escape_newlines`) so a
+    multi-paragraph payload is not silently cut at its first newline by the
+    daemon's line-oriented read.
     """
-    payload = text
+    payload = escape_newlines(text)
     if voice:
         payload = VOICE_MARKER + voice + "\x03" + payload
     if interrupt:
