@@ -256,7 +256,7 @@ class KokoroEngine:
     # rather than phoneme-count-aligned (audibly better breaks), and it holds
     # the line if a future kokoro drops the internal 510-phoneme batching.
     # Its cost is the +6% duration above, from inter-chunk silence.
-    _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+')
+    _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+(?=[A-Z0-9"\'(])')
     _CHUNK_BUDGET_CHARS = 320
 
     @classmethod
