@@ -85,6 +85,9 @@ process, and overlapping lines talk over each other. `voxcaster` inverts this:
   in-flight playback mid-word, and speaks immediately.
 - **Live volume control** — one socket message, applies from the next line;
   no restart.
+- **Render to file** — the same warm daemon writes a mono wav to any path
+  (`speak --output out.wav "..."` or the `\x05RENDER\x05` wire message),
+  so voice notes and TTS integrations get audio without a per-call model load.
 - **Singleton via `flock(2)`** — clients can race to auto-spawn the daemon;
   exactly one wins, the rest exit cleanly. Stale sockets are detected and
   removed on startup.
@@ -153,20 +156,20 @@ and volume control.
 
 Defaults work with no config at all. To customise, copy
 [`config.example.toml`](config.example.toml) to `~/.config/voxcaster/config.toml`
-(or point `$SPEAKD_CONFIG` at any path). Environment variables override the
+(or point `$VOXCASTER_CONFIG` at any path). Environment variables override the
 file; CLI flags override both.
 
 | TOML key | Env override | Default | Meaning |
 |---|---|---|---|
-| `tts.voice` | `SPEAKD_VOICE` | `af_heart` | Kokoro voice id (`af_*`, `am_*`, `bf_*`, `bm_*`, ...) |
-| `tts.speed` | `SPEAKD_SPEED` | `1.0` | Speech-rate multiplier |
-| `tts.lang_code` | `SPEAKD_LANG` | `a` | Kokoro language code (`a` US English, `b` UK English) |
-| `device.policy` | `SPEAKD_DEVICE` | `auto` | `auto` (dynamic offload) / `cpu` / `gpu` |
-| `device.keepalive_seconds` | `SPEAKD_KEEPALIVE` | `180` | Idle seconds before GPU→CPU offload |
-| `daemon.socket_path` | `SPEAKD_SOCKET` | `$XDG_RUNTIME_DIR/voxcaster.sock` | Unix socket path |
+| `tts.voice` | `VOXCASTER_VOICE` | `af_heart` | Kokoro voice id (`af_*`, `am_*`, `bf_*`, `bm_*`, ...) |
+| `tts.speed` | `VOXCASTER_SPEED` | `1.0` | Speech-rate multiplier |
+| `tts.lang_code` | `VOXCASTER_LANG` | `a` | Kokoro language code (`a` US English, `b` UK English) |
+| `device.policy` | `VOXCASTER_DEVICE` | `auto` | `auto` (dynamic offload) / `cpu` / `gpu` |
+| `device.keepalive_seconds` | `VOXCASTER_KEEPALIVE` | `180` | Idle seconds before GPU→CPU offload |
+| `daemon.socket_path` | `VOXCASTER_SOCKET` | `$XDG_RUNTIME_DIR/voxcaster.sock` | Unix socket path |
 | `daemon.socket_mode` | — | `"600"` | Octal permissions on the socket file |
-| `daemon.log_file` | `SPEAKD_LOG_FILE` | `~/.local/state/voxcaster/daemon.log` | Log target for auto-spawned daemons |
-| `audio.volume` | `SPEAKD_VOLUME` | `100` | Playback volume `0–130` (mpv scale) |
+| `daemon.log_file` | `VOXCASTER_LOG_FILE` | `~/.local/state/voxcaster/daemon.log` | Log target for auto-spawned daemons |
+| `audio.volume` | `VOXCASTER_VOLUME` | `100` | Playback volume `0–130` (mpv scale) |
 | `audio.max_playback_seconds` | — | `120` | Kill a single line's playback after this |
 | `audio.player` | — | mpv template | Player argv; `{file}` and `{volume}` are substituted |
 | `fallback.command` | — | espeak template | Fallback argv; `{text}` is substituted; `[]` disables |
@@ -186,6 +189,7 @@ language without a client library:
 | Speak | `<text>\n` | Queue the line; daemon replies `OK\n` when spoken |
 | Interrupt | `\x01INTERRUPT\x01<text>\n` | Drain queue, kill playback, speak now |
 | Volume | `\x02VOLUME\x02<int>\n` | Set live volume (0–130) |
+| Render | `\x05RENDER\x05<output_path>\x03<text>\n` | Synthesize text to a mono wav at `output_path` (no playback); honours the `\x03VOICE\x03` / `\x01INTERRUPT\x01` prefixes |
 
 ```bash
 # speak from raw shell, no client needed:
@@ -216,7 +220,7 @@ the model can never be moved mid-utterance.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `speak` says *fallback engine used* | Daemon failed to start — check `~/.local/state/voxcaster/daemon.log`. Most common: `kokoro` not installed in the Python that spawned it (set `SPEAKD_DAEMON_CMD="/path/to/python -m voxcaster.daemon"`). |
+| `speak` says *fallback engine used* | Daemon failed to start — check `~/.local/state/voxcaster/daemon.log`. Most common: `kokoro` not installed in the Python that spawned it (set `VOXCASTER_DAEMON_CMD="/path/to/python -m voxcaster.daemon"`). |
 | No audio, no errors | Is `mpv` installed and does it play a wav from your terminal? Swap `audio.player` if you use a different player. |
 | First line is slow | Cold start: model weights load on first request (a few seconds). Subsequent lines are fast. |
 | Robotic voice instead of Kokoro | That *is* the espeak fallback working as designed — see the first row. |

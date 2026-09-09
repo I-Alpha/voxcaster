@@ -15,6 +15,13 @@ escaping is needed and any language with a Unix-socket API can be a client.
                prefix may combine with the interrupt prefix, in either order)
     Ping:      ``\\x04PING\\x04\\n``
                (health check — daemon replies ``READY``/``STARTING``, no speech)
+    Render:    ``\x05RENDER\x05<output_path>\x03<text>\n``
+               (synthesize ``text`` and write a mono wav to ``output_path``
+               instead of playing it; honours the same ``\x03VOICE\x03`` and
+               ``\x01INTERRUPT\x01`` prefixes as a Speak line, in the same
+               nesting order. The daemon replies ``OK`` once the file has been
+               written. Used for file/voice-note output where no speaker is
+               the destination.)
 
 The daemon replies ``b"OK\\n"`` once a speak line has been spoken. Fire-and-forget
 clients simply close the connection without reading the ack.
@@ -39,6 +46,7 @@ INTERRUPT_MARKER = "\x01INTERRUPT\x01"  # SOH-flanked - never in UTF-8 speech te
 VOLUME_MARKER = "\x02VOLUME\x02"        # STX-flanked - likewise
 VOICE_MARKER = "\x03VOICE\x03"          # ETX-flanked per-request voice override
 PING_MARKER = "\x04PING\x04"            # EOT-flanked health check
+RENDER_MARKER = "\x05RENDER\x05"        # ENQ-flanked write-to-file request
 NEWLINE_ESCAPE = "\x1e"                 # RS - stands in for a literal newline
 ACK = b"OK\n"
 PING_READY = b"READY\n"                 # daemon reply: model loaded
@@ -94,3 +102,23 @@ def encode_volume(level: int) -> bytes:
 def encode_ping() -> bytes:
     """Encode a health-check request."""
     return (PING_MARKER + "\n").encode()
+
+def encode_render(text: str, output_path: str, interrupt: bool = False,
+                  voice: str | None = None) -> bytes:
+    """Encode a render-to-file request: synthesize text to a wav file.
+
+    Mirrors :func:`encode_speak` so the daemon parses both with the same
+    marker-stripping order: an optional ``\x03VOICE\x03`` prefix wraps the
+    text payload, an optional ``\x01INTERRUPT\x01`` prefix wraps the whole
+    line. The output path is the render marker's payload and is terminated
+    by the same ``\x03`` field separator the VOICE marker uses, so a path
+    containing a literal ``\x03`` is unsupported (paths with control
+    characters are pathological on every platform this daemon runs on).
+    """
+    payload = escape_newlines(text)
+    if voice:
+        payload = VOICE_MARKER + voice + "\x03" + payload
+    payload = RENDER_MARKER + output_path + "\x03" + payload
+    if interrupt:
+        payload = INTERRUPT_MARKER + payload
+    return (payload + "\n").encode()

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-09
+
+### Added
+- **Render to file (RENDER wire message)**: `speak --output out.wav "text"`
+  (or the `\x05RENDER\x05` protocol message) synthesizes through the same
+  warm daemon and writes a mono wav to the requested path instead of playing
+  it. No per-call model load, no speaker required — the intended consumer is
+  voice-note / TTS integration (e.g. OpenClaw's `tts-local-cli` provider)
+  where the destination is a file, not a speaker. Honours the existing
+  `\x03VOICE\x03` voice and `\x01INTERRUPT\x01` prefixes with the same
+  nesting order as Speak, so one parser serves both message kinds. No espeak
+  fallback for renders (a file cannot be spoken): failures are logged and the
+  request is simply not acked.
+- New client API: `voxcaster.render(text, output_path, voice=None)` and the
+  `render`/`--output` CLI surface.
+
+### Fixed
+- README config/env table still used the pre-rename `SPEAKD_*` variable
+  names; corrected to `VOXCASTER_*` (matches `config.py`'s env overrides).
+
 ## [0.3.0] - 2026-07-16
 
 ### Added

@@ -13,21 +13,21 @@ Quickstart::
 """
 from typing import TYPE_CHECKING
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 if TYPE_CHECKING:  # real imports for type checkers / IDEs
-    from .client import ensure_daemon, ping, set_volume, speak
+    from .client import ensure_daemon, ping, render, set_volume, speak
     from .config import Config, load_config
     from .markdown import extract_tts_summary, preprocess_for_speech, strip_markdown
 
 __all__ = [
-    "speak", "ping", "set_volume", "ensure_daemon",
+    "speak", "render", "ping", "set_volume", "ensure_daemon",
     "Config", "load_config",
     "strip_markdown", "extract_tts_summary", "preprocess_for_speech",
     "__version__",
 ]
 
-_CLIENT_ATTRS = ("speak", "ping", "set_volume", "ensure_daemon")
+_CLIENT_ATTRS = ("speak", "render", "ping", "set_volume", "ensure_daemon")
 _CONFIG_ATTRS = ("Config", "load_config")
 _MARKDOWN_ATTRS = ("strip_markdown", "extract_tts_summary", "preprocess_for_speech")
 

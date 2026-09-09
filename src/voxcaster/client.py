@@ -273,6 +273,37 @@ def speak(
     return False
 
 
+def render(text: str, output_path: str, voice: str | None = None,
+           config: Config | None = None) -> bool:
+    """Synthesize ``text`` to a mono wav file at ``output_path``.
+
+    The file-output sibling of :func:`speak`: the same warm daemon that
+    narrates to the speaker writes the audio to disk instead, so callers
+    (voice notes, OpenClaw TTS integration) get a playable file without
+    paying a per-call model load. ``voice`` falls back to the daemon's
+    configured voice when None. No espeak fallback exists for rendering —
+    a file cannot be spoken.
+
+    Returns True once the daemon has acked the write. Blocking by design:
+    the caller wants the file, so there is nothing to fire-and-forget.
+    """
+    text = text.strip()
+    if not text:
+        return False
+    if not output_path:
+        raise ValueError("render() requires a non-empty output_path")
+
+    cfg = _get_config(config)
+    wire = protocol.encode_render(text, output_path, voice=voice)
+
+    if _send(wire, cfg, wait_ack=True):
+        return True
+    if ensure_daemon(cfg) and _send(wire, cfg, wait_ack=True):
+        return True
+    _log_fallback(cfg, "daemon down after spawn attempt (render)")
+    return False
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -292,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="set live playback volume (0-130) before speaking")
     parser.add_argument("--voice", metavar="ID",
                         help="per-request Kokoro voice id (e.g. af_heart, bf_emma)")
+    parser.add_argument("--output", metavar="PATH",
+                        help="render to a mono wav file at PATH instead of "
+                             "playing through the speaker")
     parser.add_argument("--ping", action="store_true",
                         help="health-check the daemon and exit (prints ready/starting/down)")
     parser.add_argument("--socket", metavar="PATH", help="Unix socket path override")
@@ -320,8 +354,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_usage(sys.stderr)
         return 2
 
-    delivered = speak(text, blocking=args.blocking, interrupt=args.interrupt,
-                      voice=args.voice, config=cfg)
+    if args.output:
+        delivered = render(text, args.output, voice=args.voice, config=cfg)
+    else:
+        delivered = speak(text, blocking=args.blocking, interrupt=args.interrupt,
+                          voice=args.voice, config=cfg)
     return 0 if delivered else 1
 
 

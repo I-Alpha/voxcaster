@@ -110,6 +110,44 @@ class VoiceDaemon:
             return
         self._play(wav, sample_rate, text)
 
+    def _render_sync(self, text: str, voice: str | None,
+                     render_path: str) -> None:
+        """Synthesize ``text`` and write a mono wav to ``render_path``.
+
+        The file-output sibling of :meth:`_speak_sync`: identical synthesis
+        path (same voice override, same interrupt-supersede check), but the
+        waveform is written to disk with ``soundfile`` instead of being
+        handed to a player. Used by the RENDER wire message so callers can
+        request an audio file (voice notes, OpenClaw TTS integration) from
+        the same warm daemon -- no per-call model load.
+
+        Unlike playback there is no audible fallback: if synthesis or the
+        write fails there is nothing useful to say out loud, so the failure
+        is logged and the request is simply not acked (the client's
+        blocking wait times out and reports the error).
+        """
+        epoch = self._interrupt_epoch
+        try:
+            wav, sample_rate = self.engine.synthesize(text, voice=voice)
+        except SynthesisError as e:
+            log.warning("render synthesis failed (no fallback): %s", e)
+            return
+        if self._interrupt_epoch != epoch:
+            log.info("dropped superseded render (interrupted mid-synthesis): %s",
+                     text[:60])
+            return
+        try:
+            import soundfile as sf
+            parent = os.path.dirname(os.path.abspath(render_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            sf.write(render_path, wav, sample_rate)
+        except Exception as e:
+            log.error("render write failed for %s: %s", render_path, e)
+            return
+        log.info("rendered (%dHz, %.1fs): %s -> %s",
+                 sample_rate, len(wav) / sample_rate, text[:60], render_path)
+
     def _play(self, wav, sample_rate: int, text: str) -> None:
         import soundfile as sf
         try:
@@ -187,14 +225,22 @@ class VoiceDaemon:
         """Drain the queue one line at a time; ack each client when spoken."""
         while not self._stop.is_set():
             try:
-                text, voice, writer = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                text, voice, render_path, writer = await asyncio.wait_for(
+                    self._queue.get(), timeout=1.0
+                )
             except asyncio.TimeoutError:
                 continue
             try:
-                await loop.run_in_executor(None, self._speak_sync, text, voice)
+                if render_path is not None:
+                    await loop.run_in_executor(
+                        None, self._render_sync, text, voice, render_path
+                    )
+                else:
+                    await loop.run_in_executor(None, self._speak_sync, text, voice)
             except Exception:
-                # _speak_sync handles its own fallbacks; this guards the worker
-                # task against anything unexpected so the queue never stalls.
+                # _speak_sync/_render_sync handle their own fallbacks; this
+                # guards the worker task against anything unexpected so the
+                # queue never stalls.
                 log.exception("unexpected error while speaking %r", text[:60])
             try:
                 writer.write(protocol.ACK)
@@ -205,13 +251,15 @@ class VoiceDaemon:
             self._queue.task_done()
 
     async def _interrupt(self, text: str, writer: asyncio.StreamWriter,
-                         voice: str | None = None) -> None:
-        """Drain pending lines, cut off playback, speak ``text`` next."""
+                         voice: str | None = None,
+                         render_path: str | None = None) -> None:
+        """Drain pending lines, cut off playback, speak/render ``text`` next."""
         self._interrupt_epoch += 1  # marks any in-flight synthesis as superseded
         drained = 0
         while True:
             try:
-                _old_text, _old_voice, old_writer = self._queue.get_nowait()
+                (_old_text, _old_voice, _old_render_path,
+                 old_writer) = self._queue.get_nowait()
                 self._queue.task_done()
                 drained += 1
                 try:
@@ -223,7 +271,7 @@ class VoiceDaemon:
         killed = self._kill_current_player()
         log.info("[interrupt] drained %d queued, stopped current=%s: %s",
                  drained, killed, text[:60])
-        await self._queue.put((text, voice, writer))
+        await self._queue.put((text, voice, render_path, writer))
 
     async def _idle_offload(self, loop: asyncio.AbstractEventLoop) -> None:
         """Move the model off the GPU after ``keepalive_seconds`` of quiet."""
@@ -303,10 +351,17 @@ class VoiceDaemon:
                 writer.close()
                 return
 
-            # Strip the interrupt prefix (outermost), then the voice prefix.
+            # Strip the interrupt prefix (outermost), then the render prefix,
+            # then the voice prefix -- the same nesting order encode_speak /
+            # encode_render build, so one parser serves both message kinds.
             interrupt = text.startswith(protocol.INTERRUPT_MARKER)
             if interrupt:
                 text = text[len(protocol.INTERRUPT_MARKER):]
+            render_path: str | None = None
+            if text.startswith(protocol.RENDER_MARKER):
+                rest = text[len(protocol.RENDER_MARKER):]
+                render_path, _, text = rest.partition("\x03")
+                render_path = render_path or None
             voice: str | None = None
             if text.startswith(protocol.VOICE_MARKER):
                 rest = text[len(protocol.VOICE_MARKER):]
@@ -327,9 +382,10 @@ class VoiceDaemon:
                 return
 
             if interrupt or self.cfg.always_interrupt:
-                await self._interrupt(text, writer, voice=voice)
+                await self._interrupt(text, writer, voice=voice,
+                                      render_path=render_path)
             else:
-                await self._queue.put((text, voice, writer))
+                await self._queue.put((text, voice, render_path, writer))
         except Exception:
             writer.close()
 
