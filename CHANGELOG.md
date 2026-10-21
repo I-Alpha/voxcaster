@@ -22,6 +22,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `render`/`--output` CLI surface.
 
 ### Fixed
+- **Multi-paragraph payloads were cut at the first newline** (a4fefe7,
+  ed21fe7). The wire protocol is line-oriented and the client did not escape
+  newlines, so everything after the first newline was dropped after the ACK
+  had been sent and the client had exited 0. Measured: a 168-byte
+  three-paragraph payload arrived as 65 bytes. Newlines now travel as RS
+  (`\x1e`) and the daemon restores them before synthesis. Byte-exact arrival
+  was checked on a 200KB payload; `max_message_bytes` (16 MiB, already the
+  StreamReader limit) is now an explicit config field.
+- **Long clips were cut off mid-sentence** (ed21fe7). `max_playback_seconds`
+  killed the player at a fixed 120s. It is now a hang-protection floor: the
+  effective timeout is `max(floor, clip_duration + 30s)`.
+- **Sentence chunking** (2c57292, 4126229). Paragraphs longer than the chunk
+  budget are packed into sentence-aligned chunks of at most 320 characters,
+  and a single over-long sentence is left intact. The original commit
+  described this as a fix for Kokoro truncating long text; a controlled
+  measurement (2531 chars, 139.2s without chunking, 147.4s with) showed
+  Kokoro was never truncating, so chunking is retained only for
+  sentence-aligned boundaries, at a measured cost of about 6% extra duration
+  from inter-chunk silence. Chunking no longer splits mid-sentence on
+  abbreviations and numbers ("i.e. ", "vs. ", "4.016; "): a boundary now
+  requires the next character to look like a sentence start. This is a
+  heuristic, not a tokenizer: a sentence opening with a lowercase proper noun
+  (e.g. "iOS 18") is not split.
+- **Voice and accent changed between consecutive lines** (a4fefe7). The
+  Kokoro pipeline was rebuilt on every cross-family voice swap, which also
+  reset device state. Pipelines are now cached per `lang_code` (bounded at 2)
+  and idle offload moves all of them; 8 alternating requests build 2
+  pipelines instead of 8. A `[voice-contention]` warning is logged when a
+  request's voice differs from the configured default.
 - README config/env table still used the pre-rename `SPEAKD_*` variable
   names; corrected to `VOXCASTER_*` (matches `config.py`'s env overrides).
 
