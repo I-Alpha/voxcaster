@@ -176,7 +176,7 @@ file; CLI flags override both.
 | `audio.max_playback_seconds` | — | `120` | Kill a single line's playback after this |
 | `audio.player` | — | mpv template | Player argv; `{file}` and `{volume}` are substituted |
 | `ducking.enabled` | — | `true` | Dim other playback streams while speaking |
-| `ducking.factor` | — | `0.3` | Other streams play at this fraction of their volume, `0–1` |
+| `ducking.factor` | — | `0.3` | Amplitude multiplier for other streams, `0–1` (`0.5` is about -6 dB, `0.3` about -10.5 dB, `0.25` about -12 dB) |
 | `ducking.fade_down_ms` | — | `150` | Fade-out time when speech starts |
 | `ducking.fade_up_ms` | — | `400` | Fade-in time when speech ends |
 | `fallback.command` | — | espeak template | Fallback argv; `{text}` is substituted; `[]` disables |

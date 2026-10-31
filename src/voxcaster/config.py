@@ -105,7 +105,7 @@ class Config:
 
     # [ducking] - dim other playback streams while voxcaster speaks
     duck_enabled: bool = True
-    duck_factor: float = 0.3         # other streams play at this fraction of their volume
+    duck_factor: float = 0.3         # amplitude multiplier for other streams (0.3 = -10.5 dB)
     duck_fade_down_ms: int = 150
     duck_fade_up_ms: int = 400
     duck_state_path: str = field(default_factory=default_duck_state_path)

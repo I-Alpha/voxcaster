@@ -80,7 +80,9 @@ player = ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
 # $XDG_RUNTIME_DIR/voxcaster-duck.json so a crash cannot leave audio ducked.
 enabled = true
 
-# Other streams play at this fraction of their current volume (0 to 1).
+# Amplitude multiplier applied to other streams (0 to 1), i.e. a loudness cut:
+# 0.5 is about -6 dB, 0.3 about -10.5 dB, 0.25 about -12 dB. The server's
+# volume scale is cubic, so the raw volume is scaled by the cube root of this.
 factor = 0.3
 
 # Fade times in milliseconds.

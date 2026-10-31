@@ -79,8 +79,16 @@ def test_other_streams_are_scaled_per_channel_and_own_stream_is_left(tmp_path):
     pactl = FakePactl(stream(1, (FULL, 32768)), stream(2, pid=777))
     d = make_ducker(pactl, tmp_path)
     d.acquire(own_pid=777)
-    assert pactl.volume(1) == (19661, 9830)
+    assert pactl.volume(1) == (43872, 21936)
     assert pactl.volume(2) == (FULL, FULL)
+
+
+@pytest.mark.parametrize("factor", [0.5, 0.3, 0.25])
+def test_factor_is_the_amplitude_ratio_on_the_servers_cubic_scale(tmp_path, factor):
+    pactl = FakePactl(stream(1, (FULL, FULL)))
+    make_ducker(pactl, tmp_path, factor=factor).acquire(own_pid=777)
+    amplitude = (pactl.volume(1)[0] / FULL) ** 3
+    assert amplitude == pytest.approx(factor, abs=1e-3)
 
 
 def test_release_restores_exact_original_channels(tmp_path):
@@ -108,7 +116,7 @@ def test_fades_are_monotonic_and_land_exactly(tmp_path):
     down = [v[0] for _, v in pactl.sets]
     assert len(down) > 2
     assert down == sorted(down, reverse=True)
-    assert down[-1] == 19661
+    assert down[-1] == 43872
     assert clock.now == pytest.approx(0.15)
 
     pactl.sets.clear()
@@ -129,7 +137,7 @@ def test_nested_holders_duck_once_and_restore_on_last_release(tmp_path):
     d.acquire(own_pid=778)
     assert len(pactl.sets) == sets_after_first
     d.release()
-    assert pactl.volume(1) == (19661, 19661)
+    assert pactl.volume(1) == (43872, 43872)
     d.release()
     assert pactl.volume(1) == (FULL, FULL)
 
@@ -139,7 +147,7 @@ def test_back_to_back_lines_never_record_ducked_volume_as_original(tmp_path):
     d = make_ducker(pactl, tmp_path)
     d.acquire(own_pid=777)
     d.release(keep_ducked=True)
-    assert pactl.volume(1) == (19661, 19661)
+    assert pactl.volume(1) == (43872, 43872)
     d.acquire(own_pid=778)
     assert len(pactl.sets) == 1
     d.release()
@@ -160,7 +168,7 @@ def test_second_line_after_full_restore_ducks_from_the_real_original(tmp_path):
     d = make_ducker(pactl, tmp_path)
     for pid in (777, 778):
         d.acquire(own_pid=pid)
-        assert pactl.volume(1) == (15000, 15000)
+        assert pactl.volume(1) == (33472, 33472)
         d.release()
         assert pactl.volume(1) == (50000, 50000)
 
@@ -171,7 +179,7 @@ def test_stream_appearing_mid_speech_is_ducked_and_restored(tmp_path):
     d.acquire(own_pid=777)
     pactl.streams[2] = stream(2, (40000, 40000), app="firefox")
     d.rescan()
-    assert pactl.volume(2) == (12000, 12000)
+    assert pactl.volume(2) == (26777, 26777)
     d.release()
     assert pactl.volume(2) == (40000, 40000)
 
@@ -183,7 +191,7 @@ def test_stream_that_inherits_the_ducked_volume_restores_to_the_adopted_original
     d.acquire(own_pid=777)
     pactl.streams[2] = stream(2, pactl.volume(1), app="mpv", restore_id=role)
     d.rescan()
-    assert pactl.volume(2) == (19661, 19661)
+    assert pactl.volume(2) == (43872, 43872)
     d.release()
     assert pactl.volume(2) == (FULL, FULL)
 
@@ -192,7 +200,7 @@ def test_player_born_at_residue_volume_is_pinned_to_nominal(tmp_path):
     pactl = FakePactl(stream(1), stream(9, (33333,), pid=777, app="mpv"))
     make_ducker(pactl, tmp_path).acquire(own_pid=777)
     assert pactl.volume(9) == (FULL,)
-    assert pactl.volume(1) == (19661, 19661)
+    assert pactl.volume(1) == (43872, 43872)
 
 
 def test_player_born_muted_is_unmuted(tmp_path):

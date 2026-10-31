@@ -8,6 +8,9 @@ client's ``application.process.id``.
 Originals are written to a state file before any volume changes, so a daemon
 that dies while ducked can put the streams back on its next start
 (:meth:`Ducker.recover`).
+
+``factor`` is an amplitude multiplier. The server's raw volume scale is cubic
+(amplitude = (raw / 65536) ** 3), so the raw value is scaled by its cube root.
 """
 from __future__ import annotations
 
@@ -156,7 +159,7 @@ class Ducker:
                  poll_interval: float | None = POLL_INTERVAL_SEC) -> None:
         self._pactl = pactl
         self._state_path = state_path
-        self._factor = factor
+        self._volume_ratio = factor ** (1 / 3)
         self._fade_down = fade_down_sec
         self._fade_up = fade_up_sec
         self._enabled = enabled
@@ -286,7 +289,7 @@ class Ducker:
                     and s.volume == sibling.ducked):
                 return Ducked(s.index, s.app, s.restore_id,
                               sibling.original, sibling.ducked)
-        target = tuple(round(v * self._factor) for v in s.volume)
+        target = tuple(round(v * self._volume_ratio) for v in s.volume)
         return Ducked(s.index, s.app, s.restore_id, s.volume, target)
 
     def _restore_all(self) -> None:

@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Background-audio ducking**: while a line plays, every other playback
-  stream is dimmed (`[ducking]` `factor`, default 0.3) with a fade down and up,
-  then restored to exactly its prior per-channel volume. Uses `pactl` only.
+  stream is dimmed with a fade down and up (`[ducking]` `factor`, default 0.3,
+  is an amplitude multiplier of about -10.5 dB; the raw volume is scaled by
+  its cube root because the server's scale is cubic), then restored to
+  exactly its prior per-channel volume. Uses `pactl` only.
   Originals are persisted to a runtime-dir state file and any stale duck is
   undone at daemon start.
 
