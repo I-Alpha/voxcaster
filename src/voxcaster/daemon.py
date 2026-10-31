@@ -86,6 +86,7 @@ class VoiceDaemon:
             factor=cfg.duck_factor,
             fade_down_sec=cfg.duck_fade_down_ms / 1000,
             fade_up_sec=cfg.duck_fade_up_ms / 1000,
+            hold_sec=cfg.duck_hold_ms / 1000,
             enabled=cfg.duck_enabled,
         )
 
@@ -159,7 +160,6 @@ class VoiceDaemon:
 
     def _play(self, wav, sample_rate: int, text: str) -> None:
         import soundfile as sf
-        epoch = self._interrupt_epoch
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 sf.write(f.name, wav, sample_rate)
@@ -187,7 +187,7 @@ class VoiceDaemon:
                 proc.kill()
                 proc.wait()
             finally:
-                self._ducker.release(keep_ducked=self._line_follows(epoch))
+                self._ducker.release()
             with self._player_lock:
                 if self._current_player is proc:
                     self._current_player = None
@@ -204,12 +204,6 @@ class VoiceDaemon:
         except Exception as e:
             log.warning("audio playback failed — using fallback: %s", e)
             self._speak_fallback(text)
-
-    def _line_follows(self, epoch: int) -> bool:
-        """True when another line will play next, so the duck should be held."""
-        return self._interrupt_epoch != epoch or (
-            self._queue is not None and not self._queue.empty()
-        )
 
     def _render_player_argv(self, wav_path: str) -> list[str]:
         argv = [a.format(file=wav_path, volume=self.volume) for a in self.cfg.player]
@@ -268,8 +262,6 @@ class VoiceDaemon:
             except Exception:
                 pass  # fire-and-forget client already hung up
             self._queue.task_done()
-            if self._queue.empty():
-                await loop.run_in_executor(None, self._ducker.settle)
 
     async def _interrupt(self, text: str, writer: asyncio.StreamWriter,
                          voice: str | None = None,

@@ -179,6 +179,7 @@ file; CLI flags override both.
 | `ducking.factor` | — | `0.3` | Amplitude multiplier for other streams, `0–1` (`0.5` is about -6 dB, `0.3` about -10.5 dB, `0.25` about -12 dB) |
 | `ducking.fade_down_ms` | — | `150` | Fade-out time when speech starts |
 | `ducking.fade_up_ms` | — | `400` | Fade-in time when speech ends |
+| `ducking.hold_ms` | — | `1500` | Keep ducking this long after a line ends; if the next line has not started by then, the audio fades back up and ducks again when it does |
 | `fallback.command` | — | espeak template | Fallback argv; `{text}` is substituted; `[]` disables |
 | `client.connect_timeout` | — | `0.5` | Socket connect/send timeout (s) |
 | `client.ack_timeout` | — | `300.0` | `--blocking` wait for the spoken-ack (s) |

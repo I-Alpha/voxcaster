@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its cube root because the server's scale is cubic), then restored to
   exactly its prior per-channel volume. Uses `pactl` only.
   Originals are persisted to a runtime-dir state file and any stale duck is
-  undone at daemon start.
+  undone at daemon start. The duck is held `hold_ms` (default 1500) after a line
+  ends and released if no further line starts playing by then.
 
 ## [0.4.0] - 2026-09-09
 

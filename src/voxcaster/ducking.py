@@ -153,7 +153,8 @@ def _is_ours(current: Volume, entry: Ducked) -> bool:
 
 class Ducker:
     def __init__(self, pactl: Pactl, state_path: str, *, factor: float,
-                 fade_down_sec: float, fade_up_sec: float, enabled: bool = True,
+                 fade_down_sec: float, fade_up_sec: float, hold_sec: float = 0.0,
+                 enabled: bool = True,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic,
                  poll_interval: float | None = POLL_INTERVAL_SEC) -> None:
@@ -162,6 +163,7 @@ class Ducker:
         self._volume_ratio = factor ** (1 / 3)
         self._fade_down = fade_down_sec
         self._fade_up = fade_up_sec
+        self._hold = hold_sec
         self._enabled = enabled
         self._sleep = sleep
         self._clock = clock
@@ -172,7 +174,9 @@ class Ducker:
         self._own_pids: set[int] = set()
         self._ducked: dict[int, Ducked] = {}
         self._active = False
-        self._poller_stop: threading.Event | None = None
+        self._release_at: float | None = None
+        self._poller_running = False
+        self._wake = threading.Condition(self._lock)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -188,27 +192,28 @@ class Ducker:
             return
         with self._lock:
             self._holders += 1
+            self._release_at = None
             self._own_pids.add(own_pid)
             self._active = True
             self._start_poller()
             self._duck_new_streams()
 
     @_never_raises
-    def release(self, keep_ducked: bool = False) -> None:
-        """Drop one holder. The last one restores, unless ``keep_ducked`` says
-        another line is about to play (then :meth:`settle` restores later)."""
+    def release(self) -> None:
+        """Drop one holder. When the last goes, the duck is kept for the hold
+        time so a line that follows closely does not bounce the other audio;
+        :meth:`tick` restores once the hold has passed."""
         if not self._enabled:
             return
         with self._lock:
             self._holders = max(0, self._holders - 1)
-            if self._holders == 0 and not keep_ducked:
+            if self._holders > 0:
+                return
+            if self._hold <= 0:
                 self._restore_all()
-
-    @_never_raises
-    def settle(self) -> None:
-        with self._lock:
-            if self._active and self._holders == 0:
-                self._restore_all()
+                return
+            self._release_at = self._clock() + self._hold
+            self._wake.notify_all()
 
     @_never_raises
     def shutdown(self) -> None:
@@ -218,10 +223,15 @@ class Ducker:
                 self._restore_all()
 
     @_never_raises
-    def rescan(self) -> None:
-        """Duck streams that appeared since the last look."""
+    def tick(self) -> None:
+        """Restore once the hold after the last line has passed; otherwise duck
+        streams that appeared since the last look."""
         with self._lock:
-            if self._active:
+            if not self._active:
+                return
+            if self._release_at is not None and self._clock() >= self._release_at:
+                self._restore_all()
+            else:
                 self._duck_new_streams()
 
     @_never_raises
@@ -294,9 +304,8 @@ class Ducker:
 
     def _restore_all(self) -> None:
         self._active = False
-        if self._poller_stop is not None:
-            self._poller_stop.set()
-            self._poller_stop = None
+        self._release_at = None
+        self._wake.notify_all()
         self._own_pids.clear()
         entries, self._ducked = self._ducked, {}
         try:
@@ -346,19 +355,23 @@ class Ducker:
     # ── new-stream poller ─────────────────────────────────────────────────
 
     def _start_poller(self) -> None:
-        if self._poll_interval is None or self._poller_stop is not None:
+        if self._poll_interval is None or self._poller_running:
             return
-        stop = threading.Event()
-        self._poller_stop = stop
-        threading.Thread(target=self._poll, args=(stop,), daemon=True,
+        self._poller_running = True
+        threading.Thread(target=self._poll, daemon=True,
                          name="voxcaster-duck-poll").start()
 
-    def _poll(self, stop: threading.Event) -> None:
-        while not stop.wait(self._poll_interval):
-            with self._lock:
-                if stop.is_set():
-                    return
-                self.rescan()
+    def _poll(self) -> None:
+        with self._lock:
+            while self._active:
+                self._wake.wait(self._next_wake_delay())
+                self.tick()
+            self._poller_running = False
+
+    def _next_wake_delay(self) -> float:
+        if self._release_at is None:
+            return self._poll_interval
+        return min(self._poll_interval, max(0.0, self._release_at - self._clock()))
 
     # ── state file ────────────────────────────────────────────────────────
 

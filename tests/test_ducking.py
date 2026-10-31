@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import replace
 
 import pytest
@@ -60,7 +61,7 @@ class FakeClock:
 
 
 def make_ducker(pactl, tmp_path, *, factor=0.3, down=0.0, up=0.0, enabled=True,
-                clock=None):
+                clock=None, hold=0.0):
     clock = clock or FakeClock()
     return Ducker(
         pactl,
@@ -68,6 +69,7 @@ def make_ducker(pactl, tmp_path, *, factor=0.3, down=0.0, up=0.0, enabled=True,
         factor=factor,
         fade_down_sec=down,
         fade_up_sec=up,
+        hold_sec=hold,
         enabled=enabled,
         sleep=clock.sleep,
         clock=clock,
@@ -142,24 +144,74 @@ def test_nested_holders_duck_once_and_restore_on_last_release(tmp_path):
     assert pactl.volume(1) == (FULL, FULL)
 
 
-def test_back_to_back_lines_never_record_ducked_volume_as_original(tmp_path):
+def test_gap_shorter_than_the_hold_keeps_the_duck_and_never_ducks_twice(tmp_path):
     pactl = FakePactl(stream(1))
-    d = make_ducker(pactl, tmp_path)
+    clock = FakeClock()
+    d = make_ducker(pactl, tmp_path, clock=clock, hold=1.5)
     d.acquire(own_pid=777)
-    d.release(keep_ducked=True)
+    d.release()
+    clock.now += 1.0
+    d.tick()
     assert pactl.volume(1) == (43872, 43872)
     d.acquire(own_pid=778)
     assert len(pactl.sets) == 1
     d.release()
+    clock.now += 2.0
+    d.tick()
     assert pactl.volume(1) == (FULL, FULL)
 
 
-def test_settle_restores_a_held_duck(tmp_path):
-    pactl = FakePactl(stream(1))
-    d = make_ducker(pactl, tmp_path)
+def test_gap_longer_than_the_hold_restores_and_the_next_line_ducks_again(tmp_path):
+    pactl = FakePactl(stream(1, (50000, 50000)))
+    clock = FakeClock()
+    d = make_ducker(pactl, tmp_path, clock=clock, hold=1.5)
     d.acquire(own_pid=777)
-    d.release(keep_ducked=True)
-    d.settle()
+    d.release()
+    clock.now += 1.6
+    d.tick()
+    assert pactl.volume(1) == (50000, 50000)
+    assert not (tmp_path / "duck.json").exists()
+    d.acquire(own_pid=778)
+    assert pactl.volume(1) == (33472, 33472)
+
+
+def test_duck_is_never_released_while_a_line_is_playing(tmp_path):
+    pactl = FakePactl(stream(1))
+    clock = FakeClock()
+    d = make_ducker(pactl, tmp_path, clock=clock, hold=1.5)
+    d.acquire(own_pid=777)
+    clock.now += 60.0
+    d.tick()
+    assert pactl.volume(1) == (43872, 43872)
+
+
+def test_zero_hold_restores_as_soon_as_the_line_ends(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path, hold=0.0)
+    d.acquire(own_pid=777)
+    d.release()
+    assert pactl.volume(1) == (FULL, FULL)
+
+
+def test_shutdown_restores_a_duck_still_in_its_hold(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path, hold=1.5)
+    d.acquire(own_pid=777)
+    d.release()
+    d.shutdown()
+    assert pactl.volume(1) == (FULL, FULL)
+
+
+def test_background_poller_restores_after_the_hold_without_any_call(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = Ducker(pactl, state_path=str(tmp_path / "duck.json"), factor=0.3,
+               fade_down_sec=0.0, fade_up_sec=0.0, hold_sec=0.05,
+               poll_interval=0.02)
+    d.acquire(own_pid=777)
+    d.release()
+    deadline = time.monotonic() + 3.0
+    while pactl.volume(1) != (FULL, FULL) and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert pactl.volume(1) == (FULL, FULL)
 
 
@@ -178,7 +230,7 @@ def test_stream_appearing_mid_speech_is_ducked_and_restored(tmp_path):
     d = make_ducker(pactl, tmp_path)
     d.acquire(own_pid=777)
     pactl.streams[2] = stream(2, (40000, 40000), app="firefox")
-    d.rescan()
+    d.tick()
     assert pactl.volume(2) == (26777, 26777)
     d.release()
     assert pactl.volume(2) == (40000, 40000)
@@ -190,7 +242,7 @@ def test_stream_that_inherits_the_ducked_volume_restores_to_the_adopted_original
     d = make_ducker(pactl, tmp_path)
     d.acquire(own_pid=777)
     pactl.streams[2] = stream(2, pactl.volume(1), app="mpv", restore_id=role)
-    d.rescan()
+    d.tick()
     assert pactl.volume(2) == (43872, 43872)
     d.release()
     assert pactl.volume(2) == (FULL, FULL)
@@ -364,12 +416,12 @@ def test_ducking_config_defaults_and_toml(tmp_path):
     assert load_config(str(_write(tmp_path, ""))).duck_enabled is True
     cfg = load_config(str(_write(tmp_path, (
         "[ducking]\nenabled = false\nfactor = 0.5\n"
-        "fade_down_ms = 100\nfade_up_ms = 250\n"))))
+        "fade_down_ms = 100\nfade_up_ms = 250\nhold_ms = 300\n"))))
     assert (cfg.duck_enabled, cfg.duck_factor) == (False, 0.5)
-    assert (cfg.duck_fade_down_ms, cfg.duck_fade_up_ms) == (100, 250)
+    assert (cfg.duck_fade_down_ms, cfg.duck_fade_up_ms, cfg.duck_hold_ms) == (100, 250, 300)
     default = load_config(str(_write(tmp_path, "")))
     assert (default.duck_factor, default.duck_fade_down_ms,
-            default.duck_fade_up_ms) == (0.3, 150, 400)
+            default.duck_fade_up_ms, default.duck_hold_ms) == (0.3, 150, 400, 1500)
 
 
 def test_ducking_factor_outside_unit_interval_is_refused(tmp_path):

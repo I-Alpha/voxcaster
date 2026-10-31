@@ -89,6 +89,11 @@ factor = 0.3
 fade_down_ms = 150
 fade_up_ms = 400
 
+# How long to keep ducking after a line ends. A line that starts within this
+# time does not bounce the audio; a longer gap (slow synthesis, quiet queue)
+# lets the other audio fade back up until the next line starts playing.
+hold_ms = 1500
+
 [fallback]
 # Spoken when Kokoro or audio playback fails (and by the client when the
 # daemon cannot be reached). "{text}" is the line to speak.

@@ -108,6 +108,7 @@ class Config:
     duck_factor: float = 0.3         # amplitude multiplier for other streams (0.3 = -10.5 dB)
     duck_fade_down_ms: int = 150
     duck_fade_up_ms: int = 400
+    duck_hold_ms: int = 1500         # keep ducking this long after a line ends, for the next one
     duck_state_path: str = field(default_factory=default_duck_state_path)
 
     # [fallback] - argv template used when TTS fails; [] disables the fallback
@@ -168,6 +169,7 @@ _FILE_KEYS = [
     ("ducking", "factor", "duck_factor", float),
     ("ducking", "fade_down_ms", "duck_fade_down_ms", int),
     ("ducking", "fade_up_ms", "duck_fade_up_ms", int),
+    ("ducking", "hold_ms", "duck_hold_ms", int),
     ("fallback", "command", "fallback", lambda v: [str(a) for a in v]),
     ("client", "connect_timeout", "connect_timeout", float),
     ("client", "ack_timeout", "ack_timeout", float),
@@ -228,6 +230,6 @@ def load_config(path: str | None = None) -> Config:
         )
     if not 0.0 <= cfg.duck_factor <= 1.0:
         raise ValueError(f"[ducking] factor must be within 0..1, got {cfg.duck_factor}")
-    if cfg.duck_fade_down_ms < 0 or cfg.duck_fade_up_ms < 0:
-        raise ValueError("[ducking] fade_down_ms and fade_up_ms must be >= 0")
+    if min(cfg.duck_fade_down_ms, cfg.duck_fade_up_ms, cfg.duck_hold_ms) < 0:
+        raise ValueError("[ducking] fade_down_ms, fade_up_ms and hold_ms must be >= 0")
     return cfg
