@@ -204,6 +204,23 @@ def test_player_is_lifted_once_even_with_several_ducked_siblings(tmp_path):
     assert pactl.volume(9) == lifted
 
 
+def test_second_line_of_a_held_duck_keeps_the_first_lines_level(tmp_path):
+    role = "sink-input-by-media-role:music"
+    pactl = FakePactl(stream(1, (50000, 50000), restore_id=role),
+                      stream(2, (33333, 33333), restore_id=role))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.streams[9] = stream(9, (10000, 10000), pid=777, app="mpv", restore_id=role)
+    d.rescan()
+    first = pactl.volume(9)
+    del pactl.streams[9]
+    d.release(keep_ducked=True)
+    d.acquire(own_pid=778)
+    pactl.streams[10] = stream(10, first, pid=778, app="mpv", restore_id=role)
+    d.rescan()
+    assert pactl.volume(10) == first
+
+
 def test_player_with_its_own_restore_key_is_never_adjusted(tmp_path):
     pactl = FakePactl(stream(1, restore_id="sink-input-by-media-role:music"))
     d = make_ducker(pactl, tmp_path)

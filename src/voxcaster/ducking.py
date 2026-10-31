@@ -158,6 +158,7 @@ class Ducker:
         self._holders = 0
         self._own_pids: set[int] = set()
         self._lifted: set[int] = set()
+        self._player_volume: Volume | None = None
         self._ducked: dict[int, Ducked] = {}
         self._active = False
         self._poller_stop: threading.Event | None = None
@@ -260,15 +261,18 @@ class Ducker:
     def _lift_inherited_own_streams(self, streams: list[Stream]) -> None:
         """The server gives a new stream the volume last written under its
         stream-restore key, so the player can be born at a sibling's ducked
-        level. Put it back where the sibling started."""
+        level. Put it back where the sibling started, and give every later
+        line of the same duck the same level."""
         for s in streams:
             if s.pid not in self._own_pids or s.index in self._lifted:
                 continue
             for sibling in self._ducked.values():
                 if (s.restore_id and s.restore_id == sibling.restore_id
-                        and s.volume != sibling.original
                         and _is_ours(s.volume, sibling)):
-                    self._pactl.set_volume(s.index, sibling.original)
+                    target = self._player_volume or sibling.original
+                    if s.volume != target:
+                        self._pactl.set_volume(s.index, target)
+                    self._player_volume = target
                     self._lifted.add(s.index)
                     break
 
@@ -290,6 +294,7 @@ class Ducker:
             self._poller_stop = None
         self._own_pids.clear()
         self._lifted.clear()
+        self._player_volume = None
         entries, self._ducked = self._ducked, {}
         try:
             try:
