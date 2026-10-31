@@ -553,3 +553,36 @@ def _write(tmp_path, body):
     path = tmp_path / "config.toml"
     path.write_text(body)
     return path
+
+
+def test_reconfigure_to_disabled_restores_a_live_duck_at_once(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    assert pactl.volume(1) == (43872, 43872)
+    d.reconfigure(factor=0.3, fade_down_sec=0.0, fade_up_sec=0.0, hold_sec=0.0,
+                  enabled=False)
+    assert pactl.volume(1) == (FULL, FULL)
+    d.release()
+    assert pactl.volume(1) == (FULL, FULL)
+
+
+def test_reconfigured_factor_applies_to_the_next_duck(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path)
+    d.reconfigure(factor=0.5, fade_down_sec=0.0, fade_up_sec=0.0, hold_sec=0.0,
+                  enabled=True)
+    d.acquire(own_pid=777)
+    assert (pactl.volume(1)[0] / FULL) ** 3 == pytest.approx(0.5, abs=1e-3)
+
+
+def test_reconfigure_from_disabled_to_enabled_starts_ducking(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path, enabled=False)
+    d.acquire(own_pid=777)
+    assert pactl.volume(1) == (FULL, FULL)
+    d.release()
+    d.reconfigure(factor=0.3, fade_down_sec=0.0, fade_up_sec=0.0, hold_sec=0.0,
+                  enabled=True)
+    d.acquire(own_pid=778)
+    assert pactl.volume(1) == (43872, 43872)

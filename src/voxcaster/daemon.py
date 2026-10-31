@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import signal
@@ -104,10 +105,14 @@ class VoiceDaemon:
         # one that happened to be mid-synthesis when the interrupt arrived.
         # (int reads/writes are atomic under the GIL — no extra lock needed.)
         self._interrupt_epoch = 0
+        self._busy = False
 
     # ── synthesis + playback (blocking; runs in a thread executor) ────────
 
     def _speak_sync(self, text: str, voice: str | None = None) -> None:
+        if self.volume <= 0:
+            log.info("muted (volume 0), not speaking: %s", text[:60])
+            return
         epoch = self._interrupt_epoch
         try:
             wav, sample_rate = self.engine.synthesize(text, voice=voice)
@@ -243,6 +248,7 @@ class VoiceDaemon:
                 )
             except asyncio.TimeoutError:
                 continue
+            self._busy = True
             try:
                 if render_path is not None:
                     await loop.run_in_executor(
@@ -255,6 +261,7 @@ class VoiceDaemon:
                 # guards the worker task against anything unexpected so the
                 # queue never stalls.
                 log.exception("unexpected error while speaking %r", text[:60])
+            self._busy = False
             try:
                 writer.write(protocol.ACK)
                 await writer.drain()
@@ -267,6 +274,13 @@ class VoiceDaemon:
                          voice: str | None = None,
                          render_path: str | None = None) -> None:
         """Drain pending lines, cut off playback, speak/render ``text`` next."""
+        drained, killed = self._cut_off()
+        log.info("[interrupt] drained %d queued, stopped current=%s: %s",
+                 drained, killed, text[:60])
+        await self._queue.put((text, voice, render_path, writer))
+
+    def _cut_off(self) -> tuple[int, bool]:
+        """Drain the queue and stop playback; returns (drained, player killed)."""
         self._interrupt_epoch += 1  # marks any in-flight synthesis as superseded
         drained = 0
         while True:
@@ -281,10 +295,45 @@ class VoiceDaemon:
                     pass
             except asyncio.QueueEmpty:
                 break
-        killed = self._kill_current_player()
-        log.info("[interrupt] drained %d queued, stopped current=%s: %s",
-                 drained, killed, text[:60])
-        await self._queue.put((text, voice, render_path, writer))
+        return drained, self._kill_current_player()
+
+    def _status_json(self) -> bytes:
+        cfg = self.cfg
+        player = self._current_player
+        return (json.dumps({
+            "ready": self.engine.is_ready(),
+            "volume": self.volume,
+            "queued": self._queue.qsize(),
+            "busy": self._busy,
+            "speaking": player is not None and player.poll() is None,
+            "ducking": {
+                "enabled": cfg.duck_enabled,
+                "factor": cfg.duck_factor,
+                "fade_down_ms": cfg.duck_fade_down_ms,
+                "fade_up_ms": cfg.duck_fade_up_ms,
+                "hold_ms": cfg.duck_hold_ms,
+            },
+        }) + "\n").encode()
+
+    def _reload_ducking(self) -> bytes:
+        try:
+            fresh = load_config(self.cfg.source_file or None)
+        except Exception as e:
+            log.warning("[reload] refused: %s", e)
+            return f"ERR {e}\n".encode()
+        for attr in ("duck_enabled", "duck_factor", "duck_fade_down_ms",
+                     "duck_fade_up_ms", "duck_hold_ms"):
+            setattr(self.cfg, attr, getattr(fresh, attr))
+        self._ducker.reconfigure(
+            factor=self.cfg.duck_factor,
+            fade_down_sec=self.cfg.duck_fade_down_ms / 1000,
+            fade_up_sec=self.cfg.duck_fade_up_ms / 1000,
+            hold_sec=self.cfg.duck_hold_ms / 1000,
+            enabled=self.cfg.duck_enabled,
+        )
+        log.info("[reload] ducking enabled=%s factor=%s hold_ms=%s",
+                 self.cfg.duck_enabled, self.cfg.duck_factor, self.cfg.duck_hold_ms)
+        return protocol.ACK
 
     async def _idle_offload(self, loop: asyncio.AbstractEventLoop) -> None:
         """Move the model off the GPU after ``keepalive_seconds`` of quiet."""
@@ -346,6 +395,24 @@ class VoiceDaemon:
                 return
             if text.startswith(protocol.PING_MARKER):
                 reply = protocol.PING_READY if self.engine.is_ready() else protocol.PING_STARTING
+                try:
+                    writer.write(reply)
+                    await writer.drain()
+                except Exception:
+                    pass
+                writer.close()
+                return
+            if text.startswith((protocol.STATUS_MARKER, protocol.RELOAD_MARKER,
+                                protocol.STOP_MARKER)):
+                if text.startswith(protocol.STATUS_MARKER):
+                    reply = self._status_json()
+                elif text.startswith(protocol.RELOAD_MARKER):
+                    reply = self._reload_ducking()
+                else:
+                    drained, killed = self._cut_off()
+                    log.info("[stop] drained %d queued, stopped current=%s",
+                             drained, killed)
+                    reply = protocol.ACK
                 try:
                     writer.write(reply)
                     await writer.drain()

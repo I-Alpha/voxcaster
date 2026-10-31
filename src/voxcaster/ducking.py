@@ -233,6 +233,21 @@ class Ducker:
                 self._restore_all()
 
     @_never_raises
+    def reconfigure(self, *, factor: float, fade_down_sec: float, fade_up_sec: float,
+                    hold_sec: float, enabled: bool) -> None:
+        """Apply new settings. Turning ducking off puts a live duck back at once;
+        a new depth applies from the next duck."""
+        with self._lock:
+            if self._active and not enabled:
+                self._holders = 0
+                self._restore_all()
+            self._volume_ratio = factor ** (1 / 3)
+            self._fade_down = fade_down_sec
+            self._fade_up = fade_up_sec
+            self._hold = hold_sec
+            self._enabled = enabled
+
+    @_never_raises
     def tick(self) -> None:
         """Restore once the hold after the last line has passed; otherwise duck
         streams that appeared since the last look."""

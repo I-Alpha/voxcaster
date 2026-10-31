@@ -23,6 +23,16 @@ escaping is needed and any language with a Unix-socket API can be a client.
                written. Used for file/voice-note output where no speaker is
                the destination.)
 
+    Status:    ``\\x06STATUS\\x06\\n``
+               (daemon replies one JSON line: ready, volume, queued, busy and
+               the ducking settings; no speech)
+    Reload:    ``\\x07RELOAD\\x07\\n``
+               (re-read the ``[ducking]`` section of the config file; replies
+               ``OK`` or ``ERR <reason>`` and keeps the old settings on error)
+    Stop:      ``\\x0eSTOP\\x0e\\n``
+               (drain the queue and cut off in-flight playback, speak nothing;
+               replies ``OK``)
+
 The daemon replies ``b"OK\\n"`` once a speak line has been spoken. Fire-and-forget
 clients simply close the connection without reading the ack.
 
@@ -47,6 +57,9 @@ VOLUME_MARKER = "\x02VOLUME\x02"        # STX-flanked - likewise
 VOICE_MARKER = "\x03VOICE\x03"          # ETX-flanked per-request voice override
 PING_MARKER = "\x04PING\x04"            # EOT-flanked health check
 RENDER_MARKER = "\x05RENDER\x05"        # ENQ-flanked write-to-file request
+STATUS_MARKER = "\x06STATUS\x06"        # ACK-flanked state query
+RELOAD_MARKER = "\x07RELOAD\x07"        # BEL-flanked ducking-config reload
+STOP_MARKER = "\x0eSTOP\x0e"            # SO-flanked stop-without-speaking
 NEWLINE_ESCAPE = "\x1e"                 # RS - stands in for a literal newline
 ACK = b"OK\n"
 PING_READY = b"READY\n"                 # daemon reply: model loaded
@@ -97,6 +110,18 @@ def encode_speak(text: str, interrupt: bool = False, voice: str | None = None) -
 def encode_volume(level: int) -> bytes:
     """Encode a live volume-change request."""
     return (VOLUME_MARKER + str(clamp_volume(level)) + "\n").encode()
+
+
+def encode_status() -> bytes:
+    return (STATUS_MARKER + "\n").encode()
+
+
+def encode_reload() -> bytes:
+    return (RELOAD_MARKER + "\n").encode()
+
+
+def encode_stop() -> bytes:
+    return (STOP_MARKER + "\n").encode()
 
 
 def encode_ping() -> bytes:
