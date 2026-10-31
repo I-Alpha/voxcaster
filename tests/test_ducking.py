@@ -190,6 +190,20 @@ def test_player_born_at_a_ducked_siblings_volume_is_lifted_to_the_siblings_origi
     assert pactl.volume(1) == (15000, 15000)
 
 
+def test_player_is_lifted_once_even_with_several_ducked_siblings(tmp_path):
+    role = "sink-input-by-media-role:music"
+    pactl = FakePactl(stream(1, (50000, 50000), restore_id=role),
+                      stream(2, (33333, 33333), restore_id=role))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.streams[9] = stream(9, (10000, 10000), pid=777, app="mpv", restore_id=role)
+    d.rescan()
+    lifted = pactl.volume(9)
+    assert lifted == (33333, 33333)
+    d.rescan()
+    assert pactl.volume(9) == lifted
+
+
 def test_player_with_its_own_restore_key_is_never_adjusted(tmp_path):
     pactl = FakePactl(stream(1, restore_id="sink-input-by-media-role:music"))
     d = make_ducker(pactl, tmp_path)
