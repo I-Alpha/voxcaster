@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Background-audio ducking**: while a line plays, every other playback
+  stream is dimmed (`[ducking]` `factor`, default 0.3) with a fade down and up,
+  then restored to exactly its prior per-channel volume. Uses `pactl` only.
+  Originals are persisted to a runtime-dir state file and any stale duck is
+  undone at daemon start.
+
 ## [0.4.0] - 2026-09-09
 
 ### Added

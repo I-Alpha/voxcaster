@@ -83,6 +83,9 @@ process, and overlapping lines talk over each other. `voxcaster` inverts this:
   request simply synthesizes on CPU instead of failing.
 - **Interrupt protocol** — an urgent line drains the pending queue, kills
   in-flight playback mid-word, and speaks immediately.
+- **Background-audio ducking** — other apps' playback streams (music, video)
+  dim while voxcaster speaks and return to exactly their prior volume after
+  (PulseAudio/PipeWire, via `pactl`; see `[ducking]` below).
 - **Live volume control** — one socket message, applies from the next line;
   no restart.
 - **Render to file** — the same warm daemon writes a mono wav to any path
@@ -172,6 +175,10 @@ file; CLI flags override both.
 | `audio.volume` | `VOXCASTER_VOLUME` | `100` | Playback volume `0–130` (mpv scale) |
 | `audio.max_playback_seconds` | — | `120` | Kill a single line's playback after this |
 | `audio.player` | — | mpv template | Player argv; `{file}` and `{volume}` are substituted |
+| `ducking.enabled` | — | `true` | Dim other playback streams while speaking |
+| `ducking.factor` | — | `0.3` | Other streams play at this fraction of their volume, `0–1` |
+| `ducking.fade_down_ms` | — | `150` | Fade-out time when speech starts |
+| `ducking.fade_up_ms` | — | `400` | Fade-in time when speech ends |
 | `fallback.command` | — | espeak template | Fallback argv; `{text}` is substituted; `[]` disables |
 | `client.connect_timeout` | — | `0.5` | Socket connect/send timeout (s) |
 | `client.ack_timeout` | — | `300.0` | `--blocking` wait for the spoken-ack (s) |

@@ -37,13 +37,21 @@ def _as_bool(value: object) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def default_socket_path() -> str:
-    """Per-user socket path: ``$XDG_RUNTIME_DIR/voxcaster.sock`` when available,
-    otherwise a uid-suffixed path under the system temp dir."""
+def _runtime_path(name: str, suffix: str) -> str:
+    """``$XDG_RUNTIME_DIR/<name><suffix>`` when available, otherwise a
+    uid-suffixed path under the system temp dir."""
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if runtime_dir and os.path.isdir(runtime_dir):
-        return os.path.join(runtime_dir, "voxcaster.sock")
-    return os.path.join(tempfile.gettempdir(), f"voxcaster-{os.getuid()}.sock")
+        return os.path.join(runtime_dir, name + suffix)
+    return os.path.join(tempfile.gettempdir(), f"{name}-{os.getuid()}{suffix}")
+
+
+def default_socket_path() -> str:
+    return _runtime_path("voxcaster", ".sock")
+
+
+def default_duck_state_path() -> str:
+    return _runtime_path("voxcaster-duck", ".json")
 
 
 def default_state_dir() -> str:
@@ -94,6 +102,13 @@ class Config:
     player: list[str] = field(
         default_factory=lambda: ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
     )
+
+    # [ducking] - dim other playback streams while voxcaster speaks
+    duck_enabled: bool = True
+    duck_factor: float = 0.3         # other streams play at this fraction of their volume
+    duck_fade_down_ms: int = 150
+    duck_fade_up_ms: int = 400
+    duck_state_path: str = field(default_factory=default_duck_state_path)
 
     # [fallback] - argv template used when TTS fails; [] disables the fallback
     fallback: list[str] = field(
@@ -149,6 +164,10 @@ _FILE_KEYS = [
     ("audio", "volume", "volume", int),
     ("audio", "max_playback_seconds", "max_playback_seconds", int),
     ("audio", "player", "player", lambda v: [str(a) for a in v]),
+    ("ducking", "enabled", "duck_enabled", _as_bool),
+    ("ducking", "factor", "duck_factor", float),
+    ("ducking", "fade_down_ms", "duck_fade_down_ms", int),
+    ("ducking", "fade_up_ms", "duck_fade_up_ms", int),
     ("fallback", "command", "fallback", lambda v: [str(a) for a in v]),
     ("client", "connect_timeout", "connect_timeout", float),
     ("client", "ack_timeout", "ack_timeout", float),
@@ -207,4 +226,8 @@ def load_config(path: str | None = None) -> Config:
         raise ValueError(
             f"device policy must be one of {VALID_DEVICE_POLICIES}, got {cfg.device!r}"
         )
+    if not 0.0 <= cfg.duck_factor <= 1.0:
+        raise ValueError(f"[ducking] factor must be within 0..1, got {cfg.duck_factor}")
+    if cfg.duck_fade_down_ms < 0 or cfg.duck_fade_up_ms < 0:
+        raise ValueError("[ducking] fade_down_ms and fade_up_ms must be >= 0")
     return cfg

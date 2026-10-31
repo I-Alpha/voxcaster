@@ -72,6 +72,21 @@ max_playback_seconds = 120
 #   player = ["ffplay", "-nodisp", "-autoexit", "-volume", "{volume}", "{file}"]
 player = ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
 
+[ducking]
+# Dim every other playback stream (browser music, video) while voxcaster
+# speaks, then restore each to exactly its prior volume. Needs `pactl`
+# (PulseAudio or PipeWire-pulse); muted streams are left alone. Voxcaster's own
+# player is recognised by process id. Originals are kept in
+# $XDG_RUNTIME_DIR/voxcaster-duck.json so a crash cannot leave audio ducked.
+enabled = true
+
+# Other streams play at this fraction of their current volume (0 to 1).
+factor = 0.3
+
+# Fade times in milliseconds.
+fade_down_ms = 150
+fade_up_ms = 400
+
 [fallback]
 # Spoken when Kokoro or audio playback fails (and by the client when the
 # daemon cannot be reached). "{text}" is the line to speak.

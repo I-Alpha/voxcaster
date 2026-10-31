@@ -35,6 +35,7 @@ import time
 
 from . import __version__, protocol
 from .config import Config, load_config
+from .ducking import Ducker, PactlCli
 from .engine import KokoroEngine, SynthesisError
 
 log = logging.getLogger("voxcaster.daemon")
@@ -79,6 +80,14 @@ class VoiceDaemon:
             keepalive_seconds=cfg.keepalive_seconds,
         )
         self.volume = protocol.clamp_volume(cfg.volume)
+        self._ducker = Ducker(
+            PactlCli(),
+            cfg.duck_state_path,
+            factor=cfg.duck_factor,
+            fade_down_sec=cfg.duck_fade_down_ms / 1000,
+            fade_up_sec=cfg.duck_fade_up_ms / 1000,
+            enabled=cfg.duck_enabled,
+        )
 
         self._queue: asyncio.Queue | None = None
         self._stop: asyncio.Event | None = None
@@ -150,6 +159,7 @@ class VoiceDaemon:
 
     def _play(self, wav, sample_rate: int, text: str) -> None:
         import soundfile as sf
+        epoch = self._interrupt_epoch
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 sf.write(f.name, wav, sample_rate)
@@ -170,11 +180,14 @@ class VoiceDaemon:
             # protection even when duration is ~0.
             duration_seconds = len(wav) / sample_rate if sample_rate else 0.0
             timeout = max(self.cfg.max_playback_seconds, duration_seconds + 30.0)
+            self._ducker.acquire(proc.pid)
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            finally:
+                self._ducker.release(keep_ducked=self._line_follows(epoch))
             with self._player_lock:
                 if self._current_player is proc:
                     self._current_player = None
@@ -191,6 +204,12 @@ class VoiceDaemon:
         except Exception as e:
             log.warning("audio playback failed — using fallback: %s", e)
             self._speak_fallback(text)
+
+    def _line_follows(self, epoch: int) -> bool:
+        """True when another line will play next, so the duck should be held."""
+        return self._interrupt_epoch != epoch or (
+            self._queue is not None and not self._queue.empty()
+        )
 
     def _render_player_argv(self, wav_path: str) -> list[str]:
         argv = [a.format(file=wav_path, volume=self.volume) for a in self.cfg.player]
@@ -249,6 +268,8 @@ class VoiceDaemon:
             except Exception:
                 pass  # fire-and-forget client already hung up
             self._queue.task_done()
+            if self._queue.empty():
+                await loop.run_in_executor(None, self._ducker.settle)
 
     async def _interrupt(self, text: str, writer: asyncio.StreamWriter,
                          voice: str | None = None,
@@ -415,6 +436,7 @@ class VoiceDaemon:
         self._stop = asyncio.Event()
         loop = asyncio.get_running_loop()
 
+        await loop.run_in_executor(None, self._ducker.recover)
         self._remove_stale_socket()
         # `limit` bounds asyncio's internal StreamReader buffer, not just an
         # advisory: the stdlib default (64 KiB) makes readline() raise
@@ -469,6 +491,7 @@ class VoiceDaemon:
             await self._stop.wait()
 
         _sd_notify("STOPPING=1")
+        await loop.run_in_executor(None, self._ducker.shutdown)
         for task in (worker_task, offload_task, watchdog_task):
             task.cancel()
             try:
