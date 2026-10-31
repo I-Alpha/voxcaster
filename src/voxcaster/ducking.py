@@ -25,6 +25,8 @@ log = logging.getLogger("voxcaster.ducking")
 
 FADE_STEP_SEC = 0.03
 POLL_INTERVAL_SEC = 0.5
+OWN_STREAM_WAIT_SEC = 1.0
+OWN_STREAM_POLL_SEC = 0.05
 PACTL_TIMEOUT_SEC = 2.0
 
 Volume = tuple[int, ...]
@@ -172,6 +174,7 @@ class Ducker:
             self._active = True
             self._start_poller()
             self._duck_new_streams()
+            self._await_own_stream(own_pid)
 
     @_never_raises
     def release(self, keep_ducked: bool = False) -> None:
@@ -242,6 +245,30 @@ class Ducker:
         if self._ducked:
             self._save_state()
         self._fade(moves, self._fade_down)
+        self._lift_inherited_own_streams(streams)
+
+    def _await_own_stream(self, own_pid: int) -> None:
+        deadline = self._clock() + OWN_STREAM_WAIT_SEC
+        while self._clock() < deadline:
+            streams = self._pactl.sink_inputs()
+            if any(s.pid == own_pid for s in streams):
+                self._lift_inherited_own_streams(streams)
+                return
+            self._sleep(OWN_STREAM_POLL_SEC)
+
+    def _lift_inherited_own_streams(self, streams: list[Stream]) -> None:
+        """The server gives a new stream the volume last written under its
+        stream-restore key, so the player can be born at a sibling's ducked
+        level. Put it back where the sibling started."""
+        for s in streams:
+            if s.pid not in self._own_pids:
+                continue
+            for sibling in self._ducked.values():
+                if (s.restore_id and s.restore_id == sibling.restore_id
+                        and s.volume != sibling.original
+                        and _is_ours(s.volume, sibling)):
+                    self._pactl.set_volume(s.index, sibling.original)
+                    break
 
     def _entry_for(self, s: Stream) -> Ducked:
         """A stream created mid-speech may start at a volume the server copied

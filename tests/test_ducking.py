@@ -92,7 +92,7 @@ def test_muted_stream_is_never_touched(tmp_path):
 
 
 def test_fades_are_monotonic_and_land_exactly(tmp_path):
-    pactl = FakePactl(stream(1, (FULL, FULL)))
+    pactl = FakePactl(stream(1, (FULL, FULL)), stream(2, pid=777))
     clock = FakeClock()
     d = make_ducker(pactl, tmp_path, down=0.15, up=0.4, clock=clock)
     d.acquire(own_pid=777)
@@ -177,6 +177,27 @@ def test_stream_that_inherits_the_ducked_volume_restores_to_the_adopted_original
     assert pactl.volume(2) == (19661, 19661)
     d.release()
     assert pactl.volume(2) == (FULL, FULL)
+
+
+def test_player_born_at_a_ducked_siblings_volume_is_lifted_to_the_siblings_original(tmp_path):
+    role = "sink-input-by-media-role:music"
+    pactl = FakePactl(stream(1, (50000, 50000), restore_id=role))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.streams[9] = stream(9, (15000, 15000), pid=777, app="mpv", restore_id=role)
+    d.rescan()
+    assert pactl.volume(9) == (50000, 50000)
+    assert pactl.volume(1) == (15000, 15000)
+
+
+def test_player_with_its_own_restore_key_is_never_adjusted(tmp_path):
+    pactl = FakePactl(stream(1, restore_id="sink-input-by-media-role:music"))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.streams[9] = stream(9, (30000, 30000), pid=777, app="mpv",
+                              restore_id="sink-input-by-media-role:event")
+    d.rescan()
+    assert pactl.volume(9) == (30000, 30000)
 
 
 def test_stream_vanishing_mid_speech_is_forgotten(tmp_path):
