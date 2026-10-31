@@ -27,6 +27,7 @@ FADE_STEP_SEC = 0.03
 POLL_INTERVAL_SEC = 0.5
 OWN_STREAM_WAIT_SEC = 1.0
 OWN_STREAM_POLL_SEC = 0.05
+NOMINAL_VOLUME = 65536  # 100% on the server's raw scale
 PACTL_TIMEOUT_SEC = 2.0
 
 Volume = tuple[int, ...]
@@ -51,6 +52,8 @@ class Pactl(Protocol):
 
     def set_volume(self, index: int, volume: Volume) -> bool:
         """False when the stream no longer exists."""
+
+    def set_mute(self, index: int, muted: bool) -> bool: ...
 
 
 @dataclass
@@ -118,6 +121,13 @@ class PactlCli:
             return False
         return True
 
+    def set_mute(self, index: int, muted: bool) -> bool:
+        try:
+            self._run("set-sink-input-mute", str(index), "1" if muted else "0")
+        except PactlError:
+            return False
+        return True
+
 
 def _never_raises(method):
     @functools.wraps(method)
@@ -157,17 +167,20 @@ class Ducker:
         self._lock = threading.RLock()
         self._holders = 0
         self._own_pids: set[int] = set()
-        self._lifted: set[int] = set()
-        self._player_volume: Volume | None = None
         self._ducked: dict[int, Ducked] = {}
         self._active = False
         self._poller_stop: threading.Event | None = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
-    @_never_raises
     def acquire(self, own_pid: int) -> None:
-        """Duck everything except ``own_pid``'s streams. Calls nest."""
+        """Pin the player's own stream to nominal volume and, when enabled,
+        duck everything else. Calls nest."""
+        self._duck_others(own_pid)
+        self._pin_player(own_pid)
+
+    @_never_raises
+    def _duck_others(self, own_pid: int) -> None:
         if not self._enabled:
             return
         with self._lock:
@@ -176,7 +189,6 @@ class Ducker:
             self._active = True
             self._start_poller()
             self._duck_new_streams()
-            self._await_own_stream(own_pid)
 
     @_never_raises
     def release(self, keep_ducked: bool = False) -> None:
@@ -247,34 +259,24 @@ class Ducker:
         if self._ducked:
             self._save_state()
         self._fade(moves, self._fade_down)
-        self._lift_inherited_own_streams(streams)
 
-    def _await_own_stream(self, own_pid: int) -> None:
+    @_never_raises
+    def _pin_player(self, own_pid: int) -> None:
+        """The server gives a new stream the volume and mute last stored under
+        its restore key (the media role for mpv), which other streams'
+        volume changes, ducking included, overwrite. The player must not
+        depend on that residue, so it is set explicitly."""
         deadline = self._clock() + OWN_STREAM_WAIT_SEC
-        while self._clock() < deadline:
-            streams = self._pactl.sink_inputs()
-            if any(s.pid == own_pid for s in streams):
-                self._lift_inherited_own_streams(streams)
-                return
+        while True:
+            own = [s for s in self._pactl.sink_inputs() if s.pid == own_pid]
+            if own or self._clock() >= deadline:
+                break
             self._sleep(OWN_STREAM_POLL_SEC)
-
-    def _lift_inherited_own_streams(self, streams: list[Stream]) -> None:
-        """The server gives a new stream the volume last written under its
-        stream-restore key, so the player can be born at a sibling's ducked
-        level. Put it back where the sibling started, and give every later
-        line of the same duck the same level."""
-        for s in streams:
-            if s.pid not in self._own_pids or s.index in self._lifted:
-                continue
-            for sibling in self._ducked.values():
-                if (s.restore_id and s.restore_id == sibling.restore_id
-                        and _is_ours(s.volume, sibling)):
-                    target = self._player_volume or sibling.original
-                    if s.volume != target:
-                        self._pactl.set_volume(s.index, target)
-                    self._player_volume = target
-                    self._lifted.add(s.index)
-                    break
+        for s in own:
+            if s.muted:
+                self._pactl.set_mute(s.index, False)
+            if s.volume and s.volume != (NOMINAL_VOLUME,) * len(s.volume):
+                self._pactl.set_volume(s.index, (NOMINAL_VOLUME,) * len(s.volume))
 
     def _entry_for(self, s: Stream) -> Ducked:
         """A stream created mid-speech may start at a volume the server copied
@@ -293,8 +295,6 @@ class Ducker:
             self._poller_stop.set()
             self._poller_stop = None
         self._own_pids.clear()
-        self._lifted.clear()
-        self._player_volume = None
         entries, self._ducked = self._ducked, {}
         try:
             try:

@@ -33,6 +33,15 @@ class FakePactl:
         self.streams[index] = replace(self.streams[index], volume=tuple(volume))
         return True
 
+    def set_mute(self, index, muted):
+        if index not in self.streams:
+            return False
+        self.streams[index] = replace(self.streams[index], muted=muted)
+        return True
+
+    def muted(self, index):
+        return self.streams[index].muted
+
     def volume(self, index):
         return self.streams[index].volume
 
@@ -179,56 +188,52 @@ def test_stream_that_inherits_the_ducked_volume_restores_to_the_adopted_original
     assert pactl.volume(2) == (FULL, FULL)
 
 
-def test_player_born_at_a_ducked_siblings_volume_is_lifted_to_the_siblings_original(tmp_path):
-    role = "sink-input-by-media-role:music"
-    pactl = FakePactl(stream(1, (50000, 50000), restore_id=role))
-    d = make_ducker(pactl, tmp_path)
+def test_player_born_at_residue_volume_is_pinned_to_nominal(tmp_path):
+    pactl = FakePactl(stream(1), stream(9, (33333,), pid=777, app="mpv"))
+    make_ducker(pactl, tmp_path).acquire(own_pid=777)
+    assert pactl.volume(9) == (FULL,)
+    assert pactl.volume(1) == (19661, 19661)
+
+
+def test_player_born_muted_is_unmuted(tmp_path):
+    pactl = FakePactl(stream(9, (FULL,), muted=True, pid=777, app="mpv"))
+    make_ducker(pactl, tmp_path).acquire(own_pid=777)
+    assert pactl.muted(9) is False
+
+
+def test_player_already_nominal_is_not_rewritten(tmp_path):
+    pactl = FakePactl(stream(9, (FULL, FULL), pid=777, app="mpv"))
+    make_ducker(pactl, tmp_path).acquire(own_pid=777)
+    assert pactl.sets == []
+
+
+def test_player_is_pinned_even_when_ducking_is_disabled(tmp_path):
+    pactl = FakePactl(stream(1), stream(9, (900,), pid=777, app="mpv"))
+    make_ducker(pactl, tmp_path, enabled=False).acquire(own_pid=777)
+    assert pactl.volume(9) == (FULL,)
+    assert pactl.volume(1) == (FULL, FULL)
+
+
+def test_acquire_waits_for_the_player_stream_to_appear(tmp_path):
+    pactl = FakePactl()
+    clock = FakeClock()
+    d = make_ducker(pactl, tmp_path, clock=clock)
+    original_sleep = clock.sleep
+
+    def sleep_then_spawn(seconds):
+        original_sleep(seconds)
+        if clock.now >= 0.2:
+            pactl.streams[9] = stream(9, (3000,), pid=777, app="mpv")
+
+    d._sleep = sleep_then_spawn
     d.acquire(own_pid=777)
-    pactl.streams[9] = stream(9, (15000, 15000), pid=777, app="mpv", restore_id=role)
-    d.rescan()
-    assert pactl.volume(9) == (50000, 50000)
-    assert pactl.volume(1) == (15000, 15000)
+    assert pactl.volume(9) == (FULL,)
 
 
-def test_player_is_lifted_once_even_with_several_ducked_siblings(tmp_path):
-    role = "sink-input-by-media-role:music"
-    pactl = FakePactl(stream(1, (50000, 50000), restore_id=role),
-                      stream(2, (33333, 33333), restore_id=role))
-    d = make_ducker(pactl, tmp_path)
-    d.acquire(own_pid=777)
-    pactl.streams[9] = stream(9, (10000, 10000), pid=777, app="mpv", restore_id=role)
-    d.rescan()
-    lifted = pactl.volume(9)
-    assert lifted == (33333, 33333)
-    d.rescan()
-    assert pactl.volume(9) == lifted
-
-
-def test_second_line_of_a_held_duck_keeps_the_first_lines_level(tmp_path):
-    role = "sink-input-by-media-role:music"
-    pactl = FakePactl(stream(1, (50000, 50000), restore_id=role),
-                      stream(2, (33333, 33333), restore_id=role))
-    d = make_ducker(pactl, tmp_path)
-    d.acquire(own_pid=777)
-    pactl.streams[9] = stream(9, (10000, 10000), pid=777, app="mpv", restore_id=role)
-    d.rescan()
-    first = pactl.volume(9)
-    del pactl.streams[9]
-    d.release(keep_ducked=True)
-    d.acquire(own_pid=778)
-    pactl.streams[10] = stream(10, first, pid=778, app="mpv", restore_id=role)
-    d.rescan()
-    assert pactl.volume(10) == first
-
-
-def test_player_with_its_own_restore_key_is_never_adjusted(tmp_path):
-    pactl = FakePactl(stream(1, restore_id="sink-input-by-media-role:music"))
-    d = make_ducker(pactl, tmp_path)
-    d.acquire(own_pid=777)
-    pactl.streams[9] = stream(9, (30000, 30000), pid=777, app="mpv",
-                              restore_id="sink-input-by-media-role:event")
-    d.rescan()
-    assert pactl.volume(9) == (30000, 30000)
+def test_other_apps_streams_are_not_pinned(tmp_path):
+    pactl = FakePactl(stream(1, (33333, 33333), pid=100))
+    make_ducker(pactl, tmp_path, enabled=False).acquire(own_pid=777)
+    assert pactl.sets == []
 
 
 def test_stream_vanishing_mid_speech_is_forgotten(tmp_path):
