@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Voxcaster tray
+Comment=Volume, ducking and speech controls for the voxcaster daemon
+Exec=voxcaster-tray
+Icon=audio-volume-high
+Terminal=false
+Categories=AudioVideo;Audio;
+# For login autostart copy to ~/.config/autostart/ and add:
+# X-GNOME-Autostart-enabled=true

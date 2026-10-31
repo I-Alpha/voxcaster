@@ -187,6 +187,22 @@ file; CLI flags override both.
 
 `voxcaster --print-config` shows the fully-resolved effective configuration.
 
+## Tray control
+
+`voxcaster-tray` puts an icon in the system tray (GNOME needs the AppIndicator
+extension) with: daemon status, a volume window and presets, mute, ducking
+on/off, depth (-6 / -10.5 / -12 dB) and hold presets, test voice, stop
+speech, restart daemon, open config and quit. Volume and ducking changes apply
+to the running daemon (volume message / `RELOAD`) and are written to
+`config.toml` with its comments and layout kept. It is a separate process and
+needs PyGObject (`pip install voxcaster[tray]` plus, on Debian/Ubuntu,
+`python3-gi gir1.2-ayatanaappindicator3-0.1`); if the active environment has no
+`gi` it re-runs itself under `/usr/bin/python3`. A template launcher is in
+`packaging/desktop/`.
+
+Volume is on mpv's cubic scale: dB = 60 x log10(volume / 100), so 79 is about
+-6 dB and 130 about +6.8 dB.
+
 ## Wire protocol
 
 One newline-terminated UTF-8 line per connection — easy to speak from any
@@ -196,7 +212,10 @@ language without a client library:
 |---|---|---|
 | Speak | `<text>\n` | Queue the line; daemon replies `OK\n` when spoken |
 | Interrupt | `\x01INTERRUPT\x01<text>\n` | Drain queue, kill playback, speak now |
-| Volume | `\x02VOLUME\x02<int>\n` | Set live volume (0–130) |
+| Volume | `\x02VOLUME\x02<int>\n` | Set live volume (0–130); 0 mutes: lines are acked but not synthesized or ducked |
+| Status | `\x06STATUS\x06\n` | Reply is one JSON line: `ready`, `volume`, `queued`, `busy`, `speaking`, `ducking` settings |
+| Reload | `\x07RELOAD\x07\n` | Re-read `[ducking]` from the config file; replies `OK` or `ERR <reason>` (old settings kept) |
+| Stop | `\x0eSTOP\x0e\n` | Drain the queue and cut playback without speaking; replies `OK` |
 | Render | `\x05RENDER\x05<output_path>\x03<text>\n` | Synthesize text to a mono wav at `output_path` (no playback); honours the `\x03VOICE\x03` / `\x01INTERRUPT\x01` prefixes |
 
 ```bash

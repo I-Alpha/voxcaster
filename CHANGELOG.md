@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`voxcaster-tray`**: a tray icon and menu (volume window and presets, mute,
+  ducking on/off, depth and hold, test voice, stop speech, restart daemon,
+  open config). Separate process; optional extra `voxcaster[tray]`.
+- Wire messages `STATUS` (JSON state), `RELOAD` (apply `[ducking]` from the
+  config file without a restart) and `STOP` (drain and cut playback silently).
+- Volume 0 now mutes: lines are acked but neither synthesized nor ducked.
+
 ## [0.5.0] - 2026-10-31
 
 ### Added

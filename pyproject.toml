@@ -57,6 +57,13 @@ Changelog = "https://github.com/I-Alpha/voxcaster/blob/master/CHANGELOG.md"
 [project.scripts]
 voxcaster = "voxcaster.daemon:main"
 speak = "voxcaster.client:main"
+voxcaster-tray = "voxcaster.tray:main"
+
+[project.optional-dependencies]
+# Tray control UI. Needs the system GTK stack too (apt: python3-gi
+# gir1.2-ayatanaappindicator3-0.1); `voxcaster-tray` falls back to
+# /usr/bin/python3 when the active environment has no gi.
+tray = ["PyGObject>=3.42"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
