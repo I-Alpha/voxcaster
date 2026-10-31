@@ -5,17 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-31
 
 ### Added
-- **Background-audio ducking**: while a line plays, every other playback
-  stream is dimmed with a fade down and up (`[ducking]` `factor`, default 0.3,
-  is an amplitude multiplier of about -10.5 dB; the raw volume is scaled by
-  its cube root because the server's scale is cubic), then restored to
-  exactly its prior per-channel volume. Uses `pactl` only.
-  Originals are persisted to a runtime-dir state file and any stale duck is
-  undone at daemon start. The duck is held `hold_ms` (default 1500) after a line
-  ends and released if no further line starts playing by then.
+- **Background-audio ducking** (`[ducking]`, on by default; needs `pactl`,
+  i.e. PulseAudio or PipeWire-pulse). While a line plays, every other playback
+  stream is dimmed, then restored to exactly its prior per-channel volume.
+  Muted streams are left alone; voxcaster's own player is recognised by process
+  id.
+  - `factor` (default 0.3) is an amplitude multiplier, about -10.5 dB. The
+    server's volume scale is cubic, so the raw volume is scaled by its cube
+    root (0.5 is about -6 dB, 0.25 about -12 dB).
+  - `fade_down_ms` (150) and `fade_up_ms` (400) set the fades.
+  - `hold_ms` (1500) keeps the duck after a line ends so a closely following
+    line does not bounce the audio; a longer gap (for example slow synthesis)
+    lets the audio fade back up until the next line plays.
+  - Originals are written to `$XDG_RUNTIME_DIR/voxcaster-duck.json` before any
+    change, and a stale duck is undone at daemon start, so a crash cannot leave
+    audio dimmed.
+- **The player stream is pinned to 100% and unmuted** after it spawns. The
+  server restores a new stream's volume by media role, which other streams'
+  volume changes (ducking included) overwrite, so the voice could start
+  quiet.
 
 ## [0.4.0] - 2026-09-09
 
