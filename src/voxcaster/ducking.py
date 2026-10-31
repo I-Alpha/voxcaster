@@ -32,6 +32,8 @@ OWN_STREAM_WAIT_SEC = 1.0
 OWN_STREAM_POLL_SEC = 0.05
 NOMINAL_VOLUME = 65536  # 100% on the server's raw scale
 PACTL_TIMEOUT_SEC = 2.0
+RESIDUE_TTL_SEC = 1800.0
+IDLE_POLL_FACTOR = 4
 
 Volume = tuple[int, ...]
 
@@ -142,6 +144,11 @@ def _never_raises(method):
     return wrapper
 
 
+def _key(restore_id: str, app: str) -> str:
+    """Streams sharing a key inherit each other's last volume from the server."""
+    return restore_id or f"app:{app}"
+
+
 def _is_ours(current: Volume, entry: Ducked) -> bool:
     """True while ``current`` still lies between the ducked and original levels,
     i.e. nobody but us has moved this stream's volume."""
@@ -175,6 +182,9 @@ class Ducker:
         self._ducked: dict[int, Ducked] = {}
         self._active = False
         self._release_at: float | None = None
+        # Ducked levels left under a restore key by a stream that died ducked:
+        # the server hands them to the next stream with that key.
+        self._residue: dict[str, tuple[Ducked, float]] = {}
         self._poller_running = False
         self._wake = threading.Condition(self._lock)
 
@@ -228,6 +238,7 @@ class Ducker:
         streams that appeared since the last look."""
         with self._lock:
             if not self._active:
+                self._repair_residue()
                 return
             if self._release_at is not None and self._clock() >= self._release_at:
                 self._restore_all()
@@ -237,19 +248,25 @@ class Ducker:
     @_never_raises
     def recover(self) -> None:
         """Undo a duck left behind by a previous process."""
-        entries = self._load_state()
-        if not entries:
-            return
-        streams = self._pactl.sink_inputs()
-        claimed: set[int] = set()
-        for entry in entries:
-            match = self._recovery_match(entry, streams, claimed)
-            if match is None:
-                continue
-            claimed.add(match.index)
-            self._pactl.set_volume(match.index, entry.original)
-            log.info("recovered stale duck on stream %d (%s)", match.index, match.app)
-        self._clear_state()
+        entries, residue = self._load_state()
+        with self._lock:
+            for entry in residue:
+                self._remember_residue(entry)
+            if entries:
+                streams = self._pactl.sink_inputs()
+                claimed: set[int] = set()
+                for entry in entries:
+                    match = self._recovery_match(entry, streams, claimed)
+                    if match is None:
+                        self._remember_residue(entry)
+                        continue
+                    claimed.add(match.index)
+                    self._pactl.set_volume(match.index, entry.original)
+                    log.info("recovered stale duck on stream %d (%s)",
+                             match.index, match.app)
+            self._save_state()
+            if self._residue:
+                self._start_poller()
 
     # ── ducking ───────────────────────────────────────────────────────────
 
@@ -258,7 +275,7 @@ class Ducker:
         live = {s.index: s for s in streams}
         for index in [i for i, e in self._ducked.items()
                       if i not in live or live[i].app != e.app]:
-            del self._ducked[index]
+            self._remember_residue(self._ducked.pop(index))
 
         moves: dict[int, tuple[Volume, Volume]] = {}
         for s in streams:
@@ -269,8 +286,7 @@ class Ducker:
             self._ducked[s.index] = entry
             if s.volume != entry.ducked:
                 moves[s.index] = (s.volume, entry.ducked)
-        if self._ducked:
-            self._save_state()
+        self._save_state()
         self._fade(moves, self._fade_down)
 
     @_never_raises
@@ -293,14 +309,42 @@ class Ducker:
 
     def _entry_for(self, s: Stream) -> Ducked:
         """A stream created mid-speech may start at a volume the server copied
-        from an already-ducked sibling; its true original is the sibling's."""
+        from an already-ducked sibling, or from one that died ducked; the
+        original is then the one recorded for that sibling, not what it reads."""
+        key = _key(s.restore_id, s.app)
         for sibling in self._ducked.values():
-            if (s.restore_id and s.restore_id == sibling.restore_id
-                    and s.volume == sibling.ducked):
+            if _key(sibling.restore_id, sibling.app) == key and s.volume == sibling.ducked:
                 return Ducked(s.index, s.app, s.restore_id,
                               sibling.original, sibling.ducked)
+        dead = self._residue.get(key)
+        if dead is not None and s.volume == dead[0].ducked:
+            del self._residue[key]
+            return Ducked(s.index, s.app, s.restore_id,
+                          dead[0].original, dead[0].ducked)
         target = tuple(round(v * self._volume_ratio) for v in s.volume)
         return Ducked(s.index, s.app, s.restore_id, s.volume, target)
+
+    def _remember_residue(self, entry: Ducked) -> None:
+        self._residue[_key(entry.restore_id, entry.app)] = (
+            entry, self._clock() + RESIDUE_TTL_SEC)
+
+    def _repair_residue(self) -> None:
+        """Lift streams born at a dead stream's ducked level while nothing is
+        being ducked."""
+        now = self._clock()
+        before = set(self._residue)
+        for key in [k for k, (_, expires) in self._residue.items() if expires <= now]:
+            del self._residue[key]
+        if self._residue:
+            for s in self._pactl.sink_inputs():
+                dead = self._residue.get(_key(s.restore_id, s.app))
+                if dead is not None and s.volume == dead[0].ducked:
+                    self._pactl.set_volume(s.index, dead[0].original)
+                    del self._residue[_key(s.restore_id, s.app)]
+                    log.info("lifted stream %d (%s) born at a dead stream's ducked level",
+                             s.index, s.app)
+        if set(self._residue) != before:
+            self._save_state()
 
     def _restore_all(self) -> None:
         self._active = False
@@ -320,14 +364,32 @@ class Ducker:
             for index, entry in entries.items():
                 s = live.get(index)
                 if s is None or s.app != entry.app:
+                    self._remember_residue(entry)
                     continue
                 if not _is_ours(s.volume, entry):
                     log.info("stream %d volume changed during speech; leaving it", index)
                     continue
                 moves[index] = (s.volume, entry.original)
             self._fade(moves, self._fade_up)
+            self._verify_restored({i: end for i, (_, end) in moves.items()})
         finally:
-            self._clear_state()
+            self._save_state()
+            if self._residue:
+                self._start_poller()
+
+    def _verify_restored(self, targets: dict[int, Volume]) -> None:
+        for attempt in (1, 2):
+            live = {s.index: s for s in self._pactl.sink_inputs()}
+            wrong = {i: v for i, v in targets.items()
+                     if i in live and live[i].volume != v}
+            if not wrong:
+                return
+            if attempt == 2:
+                log.warning("restore did not take on streams %s (wanted %s)",
+                            sorted(wrong), wrong)
+                return
+            for index, volume in wrong.items():
+                self._pactl.set_volume(index, volume)
 
     def _fade(self, moves: dict[int, tuple[Volume, Volume]], seconds: float) -> None:
         if not moves:
@@ -363,12 +425,14 @@ class Ducker:
 
     def _poll(self) -> None:
         with self._lock:
-            while self._active:
+            while self._active or self._residue:
                 self._wake.wait(self._next_wake_delay())
                 self.tick()
             self._poller_running = False
 
     def _next_wake_delay(self) -> float:
+        if not self._active:
+            return self._poll_interval * IDLE_POLL_FACTOR
         if self._release_at is None:
             return self._poll_interval
         return min(self._poll_interval, max(0.0, self._release_at - self._clock()))
@@ -376,21 +440,29 @@ class Ducker:
     # ── state file ────────────────────────────────────────────────────────
 
     def _save_state(self) -> None:
+        if not self._ducked and not self._residue:
+            self._clear_state()
+            return
         tmp = self._state_path + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump({"entries": [asdict(e) for e in self._ducked.values()]}, fh)
+            json.dump({
+                "entries": [asdict(e) for e in self._ducked.values()],
+                "residue": [asdict(e) for e, _ in self._residue.values()],
+            }, fh)
         os.replace(tmp, self._state_path)
 
-    def _load_state(self) -> list[Ducked]:
+    def _load_state(self) -> tuple[list[Ducked], list[Ducked]]:
         try:
             with open(self._state_path) as fh:
-                return [Ducked.from_json(e) for e in json.load(fh)["entries"]]
+                raw = json.load(fh)
+            return ([Ducked.from_json(e) for e in raw["entries"]],
+                    [Ducked.from_json(e) for e in raw.get("residue", [])])
         except FileNotFoundError:
-            return []
+            return [], []
         except (OSError, ValueError, KeyError, TypeError) as e:
             log.warning("ignoring unreadable duck state %s: %s", self._state_path, e)
             self._clear_state()
-            return []
+            return [], []
 
     def _clear_state(self) -> None:
         try:

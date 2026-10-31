@@ -21,6 +21,7 @@ class FakePactl:
         self.streams = {s.index: s for s in streams}
         self.sets = []
         self.fail = False
+        self.ignore_sets = {}
 
     def sink_inputs(self):
         if self.fail:
@@ -31,6 +32,9 @@ class FakePactl:
         if index not in self.streams:
             return False
         self.sets.append((index, tuple(volume)))
+        if self.ignore_sets.get(index, 0) > 0:
+            self.ignore_sets[index] -= 1
+            return True
         self.streams[index] = replace(self.streams[index], volume=tuple(volume))
         return True
 
@@ -294,6 +298,122 @@ def test_other_apps_streams_are_not_pinned(tmp_path):
     pactl = FakePactl(stream(1, (33333, 33333), pid=100))
     make_ducker(pactl, tmp_path, enabled=False).acquire(own_pid=777)
     assert pactl.sets == []
+
+
+CHROME = "sink-input-by-application-name:Google Chrome"
+
+
+def chrome(index, volume=(FULL, FULL)):
+    return stream(index, volume, app="Google Chrome", restore_id=CHROME)
+
+
+def test_stream_reborn_at_a_dead_streams_ducked_volume_keeps_the_true_original(tmp_path):
+    pactl = FakePactl(chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    pactl.streams[2] = chrome(2, (43872, 43872))
+    d.tick()
+    assert pactl.volume(2) == (43872, 43872)
+    d.release()
+    assert pactl.volume(2) == (FULL, FULL)
+
+
+def test_repeated_stream_deaths_never_compound_the_duck(tmp_path):
+    pactl = FakePactl(chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    index = 1
+    for cycle in range(3):
+        d.acquire(own_pid=777)
+        assert pactl.volume(index) == (43872, 43872)
+        del pactl.streams[index]
+        index += 1
+        pactl.streams[index] = chrome(index, (43872, 43872))
+        d.tick()
+        d.release()
+        assert pactl.volume(index) == (FULL, FULL)
+        pactl.streams[index] = chrome(index)
+
+
+def test_stream_born_ducked_after_the_line_is_repaired_while_idle(tmp_path):
+    pactl = FakePactl(chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    d.release()
+    pactl.streams[2] = chrome(2, (43872, 43872))
+    d.tick()
+    assert pactl.volume(2) == (FULL, FULL)
+    d.tick()
+    assert len(pactl.sets) == 2
+    assert not (tmp_path / "duck.json").exists()
+
+
+def test_stream_at_a_different_volume_than_the_dead_ones_ducked_level_is_left_alone(tmp_path):
+    pactl = FakePactl(chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    d.release()
+    pactl.streams[2] = chrome(2, (50000, 50000))
+    d.tick()
+    assert pactl.volume(2) == (50000, 50000)
+
+
+def test_residue_is_forgotten_after_its_time_is_up(tmp_path):
+    pactl = FakePactl(chrome(1))
+    clock = FakeClock()
+    d = make_ducker(pactl, tmp_path, clock=clock)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    d.release()
+    clock.now += 3600.0
+    pactl.streams[2] = chrome(2, (43872, 43872))
+    d.tick()
+    assert pactl.volume(2) == (43872, 43872)
+    assert not (tmp_path / "duck.json").exists()
+
+
+def test_residue_survives_a_daemon_restart(tmp_path):
+    pactl = FakePactl(chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    d.release()
+    pactl.streams[2] = chrome(2, (43872, 43872))
+    fresh = make_ducker(pactl, tmp_path)
+    fresh.recover()
+    fresh.tick()
+    assert pactl.volume(2) == (FULL, FULL)
+
+
+def test_recovery_restores_the_recorded_original_exactly_once(tmp_path):
+    pactl = FakePactl(stream(1, (51118, 40001)))
+    make_ducker(pactl, tmp_path).acquire(own_pid=777)
+    make_ducker(pactl, tmp_path).recover()
+    assert pactl.volume(1) == (51118, 40001)
+    sets = len(pactl.sets)
+    make_ducker(pactl, tmp_path).recover()
+    assert len(pactl.sets) == sets
+
+
+def test_restore_that_did_not_take_is_retried_once(tmp_path):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.ignore_sets[1] = 1
+    d.release()
+    assert pactl.volume(1) == (FULL, FULL)
+
+
+def test_restore_that_never_takes_is_logged_as_a_warning(tmp_path, caplog):
+    pactl = FakePactl(stream(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.ignore_sets[1] = 100
+    with caplog.at_level("WARNING", logger="voxcaster.ducking"):
+        d.release()
+    assert any("did not take" in r.message for r in caplog.records)
 
 
 def test_stream_vanishing_mid_speech_is_forgotten(tmp_path):
