@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-11-01
+
+### Added
+- Tray icon set: a kabuki mask drawn as a symbolic icon, shipped inside the
+  package (`voxcaster/icons/*.svg`). The tray shows an idle mask, a muted
+  mask, a daemon-down mask, and a three-frame sound-wave animation while a
+  line is being spoken.
+- A paused line does not animate: while the daemon reports `paused` the tray
+  shows the idle icon instead of the speaking waves.
+
+### Changed
+- The tray hides the "Agent voices" submenu when no agent has a voice mapped.
+
 ## [0.5.1] - 2026-11-01
 
 ### Fixed

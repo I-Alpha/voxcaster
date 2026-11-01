@@ -13,7 +13,7 @@ Quickstart::
 """
 from typing import TYPE_CHECKING
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 if TYPE_CHECKING:  # real imports for type checkers / IDEs
     from .client import ensure_daemon, ping, render, set_volume, speak
