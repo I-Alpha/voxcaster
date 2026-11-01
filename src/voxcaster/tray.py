@@ -18,10 +18,14 @@ from .traylogic import (
     DEFAULT_CONFIG,
     DEPTHS,
     HOLDS_MS,
+    ICON_DIR,
     PRESETS,
+    WAVE_FRAME_MS,
     SocketWire,
     TrayController,
     db_to_volume,
+    icon_name,
+    is_speaking,
     line_label,
     volume_to_db,
 )
@@ -99,10 +103,12 @@ class TrayApp:
         self.controller = controller
         self._syncing = False
         self._volume_window: VolumeWindow | None = None
+        self._status: dict | None = None
+        self._frame = 0
         self._shown_queue: list[tuple[int, str]] | None = None
-        self.indicator = AppIndicator.Indicator.new(
-            "voxcaster", "audio-volume-high",
-            AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+        self.indicator = AppIndicator.Indicator.new_with_path(
+            "voxcaster", icon_name(None),
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS, ICON_DIR)
         self.indicator.set_title("Voxcaster")
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.items: dict[str, object] = {}
@@ -150,12 +156,14 @@ class TrayApp:
         self.menu.append(self.items["queue"])
         self._item("test", "Test voice", self.controller.test_voice)
         self._item("stop", "Stop everything", self.controller.stop_speech)
-        voices = Gtk.Menu()
-        for name, voice in self.controller.agent_voices():
-            entry = Gtk.MenuItem(label=f"{name}: {voice}")
-            entry.set_sensitive(False)
-            voices.append(entry)
-        self.menu.append(self._submenu("Agent voices (read only)", voices))
+        agent_voices = self.controller.agent_voices()
+        if agent_voices:
+            voices = Gtk.Menu()
+            for name, voice in agent_voices:
+                entry = Gtk.MenuItem(label=f"{name}: {voice}")
+                entry.set_sensitive(False)
+                voices.append(entry)
+            self.menu.append(self._submenu("Agent voices (read only)", voices))
         self.menu.append(Gtk.SeparatorMenuItem())
 
         self._item("restart", "Restart daemon", self.controller.restart_daemon)
@@ -233,6 +241,18 @@ class TrayApp:
 
     # ── state ─────────────────────────────────────────────────────────────
 
+    def _show_icon(self) -> None:
+        s = self._status
+        self.indicator.set_icon_full(
+            icon_name(s, self._frame),
+            "daemon down" if s is None else "muted" if s["volume"] <= 0 else "voice on")
+
+    def animate(self) -> bool:
+        if is_speaking(self._status):
+            self._frame += 1
+            self._show_icon()
+        return True
+
     def _show_transport(self, s: dict) -> None:
         voices = self.controller.agent_voices()
         current, queue = s.get("current"), s.get("queue", [])
@@ -262,11 +282,12 @@ class TrayApp:
 
     def refresh(self) -> bool:
         s = self.controller.status()
+        self._status = s
+        self._show_icon()
         self._syncing = True
         try:
             if s is None:
                 self.items["status"].set_label("Voxcaster: daemon not running")
-                self.indicator.set_icon_full("dialog-error", "daemon down")
                 return True
             muted = s["volume"] <= 0
             state = "ready" if s["ready"] else "starting"
@@ -274,9 +295,6 @@ class TrayApp:
             self.items["status"].set_label(
                 f"Voxcaster: {state}, {doing}, queue {s['queued']}, "
                 f"volume {s['volume']} ({_db_text(s['volume'])})")
-            self.indicator.set_icon_full(
-                "audio-volume-muted" if muted else "audio-volume-high",
-                "muted" if muted else "voice on")
             self.items["mute"].set_active(muted)
             self._show_transport(s)
             duck = s["ducking"]
@@ -327,6 +345,7 @@ def main(argv: list[str] | None = None) -> None:
     controller = TrayController(SocketWire(socket_path), config_path=args.config)
     app = TrayApp(controller)
     GLib.timeout_add_seconds(REFRESH_SECONDS, app.refresh)
+    GLib.timeout_add(WAVE_FRAME_MS, app.animate)
     try:
         Gtk.main()
     finally:

@@ -65,5 +65,8 @@ voxcaster-tray = "voxcaster.tray:main"
 # /usr/bin/python3 when the active environment has no gi.
 tray = ["PyGObject>=3.42"]
 
+[tool.setuptools.package-data]
+voxcaster = ["icons/*.svg"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

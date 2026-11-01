@@ -1,12 +1,16 @@
 import json
+import os
 
 import pytest
 
 from voxcaster import protocol
 from voxcaster.traylogic import (
+    ICON_DIR,
     PRESETS,
+    WAVE_FRAMES,
     TrayController,
     db_to_volume,
+    icon_name,
     line_label,
     set_toml_value,
     volume_to_db,
@@ -189,6 +193,19 @@ def test_agent_voice_map_is_read_only(tmp_path):
     assert json.loads(agents.read_text()) == {"agents": {"builder": "am_michael"}}
 
 
+def test_icon_name_per_state_and_wave_frames_cycle_while_speaking():
+    idle = {"volume": 100, "speaking": False}
+    speaking = {"volume": 100, "speaking": True}
+    assert icon_name(None) == "voxcaster-down-symbolic"
+    assert icon_name({"volume": 0, "speaking": True}) == "voxcaster-muted-symbolic"
+    assert icon_name(idle, frame=2) == "voxcaster-idle-symbolic"
+    frames = [icon_name(speaking, i) for i in range(len(WAVE_FRAMES) + 1)]
+    assert frames[0] == frames[len(WAVE_FRAMES)] != frames[1]
+    every = set(frames) | {icon_name(idle), icon_name(None), icon_name({"volume": 0, "speaking": False})}
+    for name in every:
+        assert os.path.exists(os.path.join(ICON_DIR, name + ".svg"))
+
+
 def test_skip_and_clear_send_their_wire_messages(tmp_path):
     wire = FakeWire()
     c, _, _ = controller(tmp_path, wire)
@@ -244,3 +261,8 @@ def test_a_preview_at_the_daemons_cut_length_shows_an_ellipsis():
     assert not line_label({"voice": None, "text": cut[:-1]}, []).endswith("...")
     spaced = ("word " * 20)[:protocol.PREVIEW_CHARS]
     assert line_label({"voice": None, "text": spaced}, []).endswith("...")
+
+
+def test_a_paused_line_does_not_animate_the_speaking_icon():
+    paused = {"volume": 100, "speaking": True, "paused": True}
+    assert icon_name(paused, frame=1) == "voxcaster-idle-symbolic"

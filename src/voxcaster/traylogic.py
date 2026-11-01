@@ -26,6 +26,24 @@ PRESETS = (("Quiet", -6.0), ("Medium", 0.0), ("Normal", 3.9), ("Loud", 6.8))
 DEPTHS = (("Gentle  -6 dB", 0.5), ("Normal  -10.5 dB", 0.3), ("Deep  -12 dB", 0.25))
 HOLDS_MS = (0, 500, 1500, 3000)
 
+ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+WAVE_FRAMES = ("wave1", "wave2", "wave3", "wave2")
+WAVE_FRAME_MS = 250
+
+
+def is_speaking(status: dict | None) -> bool:
+    return bool(status and status["speaking"] and not status.get("paused"))
+
+
+def icon_name(status: dict | None, frame: int = 0) -> str:
+    if status is None:
+        return "voxcaster-down-symbolic"
+    if status["volume"] <= 0:
+        return "voxcaster-muted-symbolic"
+    if is_speaking(status):
+        return f"voxcaster-{WAVE_FRAMES[frame % len(WAVE_FRAMES)]}-symbolic"
+    return "voxcaster-idle-symbolic"
+
 
 def speaker_label(voice: str | None, agent_voices: list[tuple[str, str]]) -> str:
     """The agent that owns ``voice``; the voice id itself when several agents
