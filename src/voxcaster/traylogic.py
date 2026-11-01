@@ -27,6 +27,21 @@ DEPTHS = (("Gentle  -6 dB", 0.5), ("Normal  -10.5 dB", 0.3), ("Deep  -12 dB", 0.
 HOLDS_MS = (0, 500, 1500, 3000)
 
 
+def speaker_label(voice: str | None, agent_voices: list[tuple[str, str]]) -> str:
+    """The agent that owns ``voice``; the voice id itself when several agents
+    share it, ``default`` when the line carries no voice."""
+    if voice is None:
+        return "default"
+    owners = [name for name, v in agent_voices if v == voice]
+    return owners[0] if len(owners) == 1 else voice
+
+
+def line_label(line: dict, agent_voices: list[tuple[str, str]]) -> str:
+    ellipsis = "..." if len(line["text"]) >= protocol.PREVIEW_CHARS else ""
+    text = " ".join(line["text"].split())
+    return f"{speaker_label(line['voice'], agent_voices)}: {text}{ellipsis}"
+
+
 def volume_to_db(volume: int) -> float:
     return 60.0 * math.log10(volume / 100) if volume > 0 else float("-inf")
 
@@ -213,6 +228,24 @@ class TrayController:
 
     def stop_speech(self) -> None:
         self._wire.request(protocol.encode_stop())
+
+    def skip(self) -> None:
+        self._wire.request(protocol.encode_skip())
+
+    def toggle_pause(self) -> bool | None:
+        """Returns whether the daemon is now paused, or None if it did not answer."""
+        s = self.status()
+        if s is None:
+            return None
+        paused = not s.get("paused", False)
+        self._wire.request(protocol.encode_pause() if paused else protocol.encode_resume())
+        return paused
+
+    def clear_queue(self) -> None:
+        self._wire.request(protocol.encode_clear())
+
+    def drop_line(self, line_id: int) -> bool:
+        return self._wire.request(protocol.encode_drop(line_id)) == protocol.ACK
 
     def restart_daemon(self) -> None:
         self._run(["systemctl", "--user", "restart", SERVICE])

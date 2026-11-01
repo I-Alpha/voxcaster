@@ -22,6 +22,7 @@ from .traylogic import (
     SocketWire,
     TrayController,
     db_to_volume,
+    line_label,
     volume_to_db,
 )
 
@@ -37,6 +38,7 @@ except (ImportError, ValueError):
 
 REFRESH_SECONDS = 3
 VOLUME_DEBOUNCE_MS = 350
+REFRESH_AFTER_ACTION_MS = 250
 SYSTEM_PYTHON = "/usr/bin/python3"
 
 
@@ -97,6 +99,7 @@ class TrayApp:
         self.controller = controller
         self._syncing = False
         self._volume_window: VolumeWindow | None = None
+        self._shown_queue: list[tuple[int, str]] | None = None
         self.indicator = AppIndicator.Indicator.new(
             "voxcaster", "audio-volume-high",
             AppIndicator.IndicatorCategory.APPLICATION_STATUS)
@@ -138,8 +141,15 @@ class TrayApp:
         self.menu.append(self._submenu("Ducking", self._ducking_menu()))
         self.menu.append(Gtk.SeparatorMenuItem())
 
+        self._item("now", "Now: nothing playing").set_sensitive(False)
+        self._item("skip", "Skip current line", self.controller.skip)
+        self._item("pause", "Pause", self.controller.toggle_pause)
+        self._item("clear", "Clear queue", self.controller.clear_queue)
+        self._queue_menu = Gtk.Menu()
+        self.items["queue"] = self._submenu("Queue", self._queue_menu)
+        self.menu.append(self.items["queue"])
         self._item("test", "Test voice", self.controller.test_voice)
-        self._item("stop", "Stop current speech", self.controller.stop_speech)
+        self._item("stop", "Stop everything", self.controller.stop_speech)
         voices = Gtk.Menu()
         for name, voice in self.controller.agent_voices():
             entry = Gtk.MenuItem(label=f"{name}: {voice}")
@@ -151,6 +161,7 @@ class TrayApp:
         self._item("restart", "Restart daemon", self.controller.restart_daemon)
         self._item("config", "Open config", self.controller.open_config)
         self._item("quit", "Quit", self.quit)
+        self.menu.connect("show", lambda _m: self.refresh())
         self.menu.show_all()
         return self.menu
 
@@ -191,6 +202,8 @@ class TrayApp:
             handler()
         except Exception as e:
             self.items["status"].set_label(f"Voxcaster: {e}")
+        else:
+            GLib.timeout_add(REFRESH_AFTER_ACTION_MS, lambda: self.refresh() and False)
 
     def _on_mute(self) -> None:
         if not self._syncing:
@@ -220,6 +233,33 @@ class TrayApp:
 
     # ── state ─────────────────────────────────────────────────────────────
 
+    def _show_transport(self, s: dict) -> None:
+        voices = self.controller.agent_voices()
+        current, queue = s.get("current"), s.get("queue", [])
+        self.items["now"].set_label(
+            "Now: " + (line_label(current, voices) if current else "nothing playing"))
+        self.items["pause"].set_label("Resume" if s.get("paused") else "Pause")
+        self.items["skip"].set_sensitive(current is not None)
+        self.items["clear"].set_sensitive(bool(queue))
+        self.items["queue"].set_label(f"Queue ({len(queue)})")
+        self.items["queue"].set_sensitive(bool(queue))
+        shown = [(line["id"], line_label(line, voices)) for line in queue]
+        if shown == self._shown_queue:
+            return
+        self._shown_queue = shown
+        for child in self._queue_menu.get_children():
+            self._queue_menu.remove(child)
+        for line_id, label in shown:
+            item = Gtk.MenuItem.new_with_label("Remove: " + label)
+            item.connect("activate", lambda _i, n=line_id: self._guarded(
+                lambda: self._drop(n)))
+            self._queue_menu.append(item)
+        self._queue_menu.show_all()
+
+    def _drop(self, line_id: int) -> None:
+        if not self.controller.drop_line(line_id):
+            raise RuntimeError("that line is no longer queued")
+
     def refresh(self) -> bool:
         s = self.controller.status()
         self._syncing = True
@@ -238,6 +278,7 @@ class TrayApp:
                 "audio-volume-muted" if muted else "audio-volume-high",
                 "muted" if muted else "voice on")
             self.items["mute"].set_active(muted)
+            self._show_transport(s)
             duck = s["ducking"]
             self.items["duck_enabled"].set_active(duck["enabled"])
             for factor in (f for _, f in DEPTHS):

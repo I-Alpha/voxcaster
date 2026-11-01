@@ -7,6 +7,7 @@ from voxcaster.traylogic import (
     PRESETS,
     TrayController,
     db_to_volume,
+    line_label,
     set_toml_value,
     volume_to_db,
 )
@@ -186,3 +187,60 @@ def test_agent_voice_map_is_read_only(tmp_path):
     c._agents_path = str(agents)
     assert c.agent_voices() == [("builder", "am_michael")]
     assert json.loads(agents.read_text()) == {"agents": {"builder": "am_michael"}}
+
+
+def test_skip_and_clear_send_their_wire_messages(tmp_path):
+    wire = FakeWire()
+    c, _, _ = controller(tmp_path, wire)
+    c.skip()
+    c.clear_queue()
+    assert wire.sent == [protocol.encode_skip(), protocol.encode_clear()]
+
+
+def test_pause_toggle_follows_the_daemons_state(tmp_path):
+    wire = FakeWire({"paused": False, "volume": 100})
+    c, _, _ = controller(tmp_path, wire)
+    assert c.toggle_pause() is True
+    assert wire.sent[-1] == protocol.encode_pause()
+    wire.status_reply = {"paused": True, "volume": 100}
+    assert c.toggle_pause() is False
+    assert wire.sent[-1] == protocol.encode_resume()
+
+
+def test_pause_toggle_with_the_daemon_down_sends_nothing(tmp_path):
+    class Down(FakeWire):
+        def request(self, payload):
+            raise ConnectionRefusedError
+
+    wire = Down()
+    c, _, _ = controller(tmp_path, wire)
+    assert c.toggle_pause() is None
+    assert wire.sent == []
+
+
+def test_drop_line_reports_whether_the_daemon_removed_it(tmp_path):
+    class Refusing(FakeWire):
+        def request(self, payload):
+            self.sent.append(payload)
+            return b"ERR no queued line 9\n"
+
+    c, _, _ = controller(tmp_path, FakeWire())
+    assert c.drop_line(4) is True
+    r, _, _ = controller(tmp_path, Refusing())
+    assert r.drop_line(9) is False
+
+
+def test_a_queued_line_is_labelled_with_its_agent_unless_the_voice_is_shared():
+    voices = [("builder", "am_michael"), ("scribe", "bf_emma"), ("clerk", "bf_emma")]
+    assert line_label({"voice": "am_michael", "text": "hello"}, voices) == "builder: hello"
+    assert line_label({"voice": "bf_emma", "text": "hello"}, voices) == "bf_emma: hello"
+    assert line_label({"voice": None, "text": "hello"}, voices) == "default: hello"
+    assert line_label({"voice": None, "text": "two\nlines"}, voices) == "default: two lines"
+
+
+def test_a_preview_at_the_daemons_cut_length_shows_an_ellipsis():
+    cut = "x" * protocol.PREVIEW_CHARS
+    assert line_label({"voice": None, "text": cut}, []).endswith("...")
+    assert not line_label({"voice": None, "text": cut[:-1]}, []).endswith("...")
+    spaced = ("word " * 20)[:protocol.PREVIEW_CHARS]
+    assert line_label({"voice": None, "text": spaced}, []).endswith("...")
