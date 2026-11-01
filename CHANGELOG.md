@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Live control of the line already playing. `VOLUME` (and the tray volume
+  slider, presets and mute) now changes the playing line at once through
+  mpv's IPC (`--input-ipc-server={ipc}` in the default `audio.player`);
+  volume 0 silences it and a later volume restores it. The duck is released
+  (after `hold_ms`) while the voice is paused or silent. A custom
+  `audio.player` without `{ipc}` cannot be adjusted or paused mid-line: a new
+  volume applies from the next line, skip and stop still work, and the daemon
+  logs that at start.
+- Wire messages `SKIP` (end the current line), `PAUSE` / `RESUME` (nothing
+  queued is spoken while paused; `STOP` also clears a pause; paused time does
+  not count against the playback hang limit), `CLEAR` (drop queued lines) and
+  `DROP <id>` (drop one).
+- The daemon ends the playing line on shutdown instead of waiting for it.
+- `STATUS` now reports `paused`, the `current` line and the `queue` with
+  line ids.
+- Tray: now playing, skip, pause/resume, clear queue and a queue submenu
+  (click a line to remove it). "Stop current speech" is renamed "Stop
+  everything" because it has always dropped the queue too.
 - **`voxcaster-tray`**: a tray icon and menu (volume window and presets, mute,
   ducking on/off, depth and hold, test voice, stop speech, restart daemon,
   open config). Separate process; optional extra `voxcaster[tray]`.

@@ -174,7 +174,7 @@ file; CLI flags override both.
 | `daemon.log_file` | `VOXCASTER_LOG_FILE` | `~/.local/state/voxcaster/daemon.log` | Log target for auto-spawned daemons |
 | `audio.volume` | `VOXCASTER_VOLUME` | `100` | Playback volume `0–130` (mpv scale) |
 | `audio.max_playback_seconds` | — | `120` | Kill a single line's playback after this |
-| `audio.player` | — | mpv template | Player argv; `{file}` and `{volume}` are substituted |
+| `audio.player` | - | mpv template | Player argv; `{file}`, `{volume}` and `{ipc}` (mpv IPC socket, needed for live volume and pause) are substituted |
 | `ducking.enabled` | — | `true` | Dim other playback streams while speaking |
 | `ducking.factor` | — | `0.3` | Amplitude multiplier for other streams, `0–1` (`0.5` is about -6 dB, `0.3` about -10.5 dB, `0.25` about -12 dB) |
 | `ducking.fade_down_ms` | — | `150` | Fade-out time when speech starts |
@@ -190,9 +190,11 @@ file; CLI flags override both.
 ## Tray control
 
 `voxcaster-tray` puts an icon in the system tray (GNOME needs the AppIndicator
-extension) with: daemon status, a volume window and presets, mute, ducking
-on/off, depth (-6 / -10.5 / -12 dB) and hold presets, test voice, stop
-speech, restart daemon, open config and quit. Volume and ducking changes apply
+extension) with: daemon status, the line now playing, skip, pause/resume,
+clear queue, a queue submenu (click a queued line to remove it), a volume
+window and presets, mute, ducking on/off, depth (-6 / -10.5 / -12 dB) and hold
+presets, test voice, stop everything (cut speech and drop the queue), restart
+daemon, open config and quit. Volume and ducking changes apply
 to the running daemon (volume message / `RELOAD`) and are written to
 `config.toml` with its comments and layout kept. It is a separate process and
 needs PyGObject (`pip install voxcaster[tray]` plus, on Debian/Ubuntu,
@@ -212,10 +214,14 @@ language without a client library:
 |---|---|---|
 | Speak | `<text>\n` | Queue the line; daemon replies `OK\n` when spoken |
 | Interrupt | `\x01INTERRUPT\x01<text>\n` | Drain queue, kill playback, speak now |
-| Volume | `\x02VOLUME\x02<int>\n` | Set live volume (0–130); 0 mutes: lines are acked but not synthesized or ducked |
-| Status | `\x06STATUS\x06\n` | Reply is one JSON line: `ready`, `volume`, `queued`, `busy`, `speaking`, `ducking` settings |
+| Volume | `\x02VOLUME\x02<int>\n` | Set volume (0-130) now, including the line already playing (needs `{ipc}` in `audio.player`); 0 mutes: the playing line goes silent and releases the duck, later lines are acked but not synthesized |
+| Status | `\x06STATUS\x06\n` | Reply is one JSON line: `ready`, `volume`, `queued`, `busy`, `speaking`, `paused`, `current` (`id`, `voice`, `text` cut at 60 chars, `elapsed_sec`), `queue` (waiting lines: `id`, `voice`, `text`), `ducking` settings |
 | Reload | `\x07RELOAD\x07\n` | Re-read `[ducking]` from the config file; replies `OK` or `ERR <reason>` (old settings kept) |
-| Stop | `\x0eSTOP\x0e\n` | Drain the queue and cut playback without speaking; replies `OK` |
+| Stop | `\x0eSTOP\x0e\n` | Drain the queue, cut playback and clear any pause, without speaking; replies `OK` |
+| Skip | `\x0fSKIP\x0f\n` | End the current line only; the queue plays on; replies `OK` |
+| Pause / Resume | `\x10PAUSE\x10\n` / `\x14RESUME\x14\n` | Freeze or continue the current line (needs `{ipc}`); while paused nothing queued is spoken, interrupts included, and the duck is released after `hold_ms`; a `--blocking` client waits for the resume; `STOP` also clears a pause; replies `OK` |
+| Clear | `\x15CLEAR\x15\n` | Drop every queued line, keep the current one and any pause; replies `OK`. A dropped line's client sees the connection close without `OK` |
+| Drop | `\x16DROP\x16<id>\n` | Drop one queued line by the `id` STATUS lists (ids restart with the daemon); replies `OK` or `ERR <reason>` |
 | Render | `\x05RENDER\x05<output_path>\x03<text>\n` | Synthesize text to a mono wav at `output_path` (no playback); honours the `\x03VOICE\x03` / `\x01INTERRUPT\x01` prefixes |
 
 ```bash
