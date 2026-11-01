@@ -2,7 +2,7 @@
 
 The protocol is deliberately tiny: one newline-terminated UTF-8 line per
 connection. Control messages are flagged with ASCII control characters
-(SOH / STX / ETX / EOT) that can never appear in normal speech text, so no
+(the markers below) that can never appear in normal speech text, so no
 escaping is needed and any language with a Unix-socket API can be a client.
 
     Speak:     ``<text>\\n``
@@ -25,13 +25,28 @@ escaping is needed and any language with a Unix-socket API can be a client.
 
     Status:    ``\\x06STATUS\\x06\\n``
                (daemon replies one JSON line: ready, volume, queued, busy and
-               the ducking settings; no speech)
+               the ducking settings, ``paused``, the ``current`` line
+               (id, voice, text, elapsed_sec) and the ``queue`` of waiting
+               lines (id, voice, text); no speech)
     Reload:    ``\\x07RELOAD\\x07\\n``
                (re-read the ``[ducking]`` section of the config file; replies
                ``OK`` or ``ERR <reason>`` and keeps the old settings on error)
     Stop:      ``\\x0eSTOP\\x0e\\n``
-               (drain the queue and cut off in-flight playback, speak nothing;
+               (drain the queue, cut off in-flight playback and clear any
+               pause, speak nothing; replies ``OK``)
+    Skip:      ``\\x0fSKIP\\x0f\\n``
+               (end the current line only; the queue plays on; replies ``OK``)
+    Pause:     ``\\x10PAUSE\\x10\\n`` / Resume: ``\\x14RESUME\\x14\\n``
+               (freeze or continue the current line; while paused no queued
+               line is spoken, interrupts included, until RESUME or STOP;
                replies ``OK``)
+    Clear:     ``\\x15CLEAR\\x15\\n``
+               (drop every queued line, keep the current one and any pause;
+               replies ``OK``. A dropped line's client sees the connection
+               close without ``OK``)
+    Drop:      ``\\x16DROP\\x16<id>\\n``
+               (drop one queued line by the id STATUS lists; replies ``OK`` or
+               ``ERR <reason>``)
 
 The daemon replies ``b"OK\\n"`` once a speak line has been spoken. Fire-and-forget
 clients simply close the connection without reading the ack.
@@ -60,10 +75,17 @@ RENDER_MARKER = "\x05RENDER\x05"        # ENQ-flanked write-to-file request
 STATUS_MARKER = "\x06STATUS\x06"        # ACK-flanked state query
 RELOAD_MARKER = "\x07RELOAD\x07"        # BEL-flanked ducking-config reload
 STOP_MARKER = "\x0eSTOP\x0e"            # SO-flanked stop-without-speaking
+SKIP_MARKER = "\x0fSKIP\x0f"            # SI-flanked end-current-line
+PAUSE_MARKER = "\x10PAUSE\x10"          # DLE-flanked pause
+RESUME_MARKER = "\x14RESUME\x14"        # DC4-flanked resume
+CLEAR_MARKER = "\x15CLEAR\x15"          # NAK-flanked drop-queued-lines
+DROP_MARKER = "\x16DROP\x16"            # SYN-flanked drop-one-queued-line
 NEWLINE_ESCAPE = "\x1e"                 # RS - stands in for a literal newline
 ACK = b"OK\n"
 PING_READY = b"READY\n"                 # daemon reply: model loaded
 PING_STARTING = b"STARTING\n"           # daemon reply: model not loaded yet
+
+PREVIEW_CHARS = 60
 
 VOLUME_MIN = 0
 VOLUME_MAX = 130  # mpv volume scale: 100 = nominal, >100 = software gain
@@ -107,21 +129,49 @@ def encode_speak(text: str, interrupt: bool = False, voice: str | None = None) -
     return (payload + "\n").encode()
 
 
+def _marked_int(marker: str, number: int) -> bytes:
+    return (marker + str(int(number)) + "\n").encode()
+
+
 def encode_volume(level: int) -> bytes:
     """Encode a live volume-change request."""
-    return (VOLUME_MARKER + str(clamp_volume(level)) + "\n").encode()
+    return _marked_int(VOLUME_MARKER, clamp_volume(level))
+
+
+def _bare(marker: str) -> bytes:
+    return (marker + "\n").encode()
 
 
 def encode_status() -> bytes:
-    return (STATUS_MARKER + "\n").encode()
+    return _bare(STATUS_MARKER)
 
 
 def encode_reload() -> bytes:
-    return (RELOAD_MARKER + "\n").encode()
+    return _bare(RELOAD_MARKER)
 
 
 def encode_stop() -> bytes:
-    return (STOP_MARKER + "\n").encode()
+    return _bare(STOP_MARKER)
+
+
+def encode_skip() -> bytes:
+    return _bare(SKIP_MARKER)
+
+
+def encode_pause() -> bytes:
+    return _bare(PAUSE_MARKER)
+
+
+def encode_resume() -> bytes:
+    return _bare(RESUME_MARKER)
+
+
+def encode_clear() -> bytes:
+    return _bare(CLEAR_MARKER)
+
+
+def encode_drop(line_id: int) -> bytes:
+    return _marked_int(DROP_MARKER, line_id)
 
 
 def encode_ping() -> bytes:

@@ -68,9 +68,12 @@ volume = 100
 max_playback_seconds = 120
 
 # Audio player argv template. "{file}" is the wav path, "{volume}" the
-# current volume. Swap in any player you like, e.g. ffplay:
+# current volume, "{ipc}" a socket path for mpv's JSON IPC. With "{ipc}" a
+# volume, mute or pause change reaches the line already playing; a player
+# without it only picks up a new volume on the next line and cannot be paused
+# (skip and stop still work). Swap in any player you like, e.g. ffplay:
 #   player = ["ffplay", "-nodisp", "-autoexit", "-volume", "{volume}", "{file}"]
-player = ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
+player = ["mpv", "--no-terminal", "--volume={volume}", "--input-ipc-server={ipc}", "{file}"]
 
 [ducking]
 # Dim every other playback stream (browser music, video) while voxcaster

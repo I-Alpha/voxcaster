@@ -100,7 +100,8 @@ class Config:
                                           # longer than this get their own actual
                                           # duration + margin instead of being cut off
     player: list[str] = field(
-        default_factory=lambda: ["mpv", "--no-terminal", "--volume={volume}", "{file}"]
+        default_factory=lambda: ["mpv", "--no-terminal", "--volume={volume}",
+                                 "--input-ipc-server={ipc}", "{file}"]
     )
 
     # [ducking] - dim other playback streams while voxcaster speaks

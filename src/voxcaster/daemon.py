@@ -33,16 +33,21 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Awaitable, Callable
 
 from . import __version__, protocol
 from .config import Config, load_config
 from .ducking import Ducker, PactlCli
 from .engine import KokoroEngine, SynthesisError
+from .linequeue import Line, LineQueue
+from .playback import Mix, MpvControl, Playback
 
 log = logging.getLogger("voxcaster.daemon")
 
 # Seconds a connected client gets to deliver its single request line.
 READLINE_TIMEOUT_SEC = 5.0
+PLAYBACK_HEADROOM_SEC = 30.0
+PAUSE_POLL_SEC = 0.1
 
 
 def _sd_notify(msg: str) -> None:
@@ -91,14 +96,27 @@ class VoiceDaemon:
             enabled=cfg.duck_enabled,
         )
 
-        self._queue: asyncio.Queue | None = None
+        self._queue: LineQueue | None = None
         self._stop: asyncio.Event | None = None
 
-        # The live audio-player process (or None). Written by _speak_sync in a
-        # thread executor; read and killed by the interrupt handler on the
-        # event loop — hence the lock.
-        self._current_player: subprocess.Popen | None = None
+        self._current_player: Playback | None = None
         self._player_lock = threading.Lock()
+        self._current_line: Line | None = None
+        self._current_started = 0.0
+        self._paused = False
+        self._unpaused = threading.Event()
+        self._unpaused.set()
+        self._controls: dict[str, Callable[[str], Awaitable[bytes | None]]] = {
+            protocol.STATUS_MARKER: self._ctl_status,
+            protocol.RELOAD_MARKER: self._ctl_reload,
+            protocol.STOP_MARKER: self._ctl_stop,
+            protocol.SKIP_MARKER: self._ctl_skip,
+            protocol.PAUSE_MARKER: self._ctl_pause,
+            protocol.RESUME_MARKER: self._ctl_resume,
+            protocol.CLEAR_MARKER: self._ctl_clear,
+            protocol.DROP_MARKER: self._ctl_drop,
+            protocol.VOLUME_MARKER: self._ctl_volume,
+        }
 
         # Bumped on every interrupt. A line that started before the bump
         # skips its playback: an urgent line must not wait behind a stale
@@ -106,6 +124,9 @@ class VoiceDaemon:
         # (int reads/writes are atomic under the GIL — no extra lock needed.)
         self._interrupt_epoch = 0
         self._busy = False
+        self._ipc_path = os.path.join(os.path.dirname(cfg.socket_path),
+                                      f"voxcaster-player-{os.getpid()}.sock")
+        self._player_has_ipc = any("{ipc}" in a for a in cfg.player)
 
     # ── synthesis + playback (blocking; runs in a thread executor) ────────
 
@@ -114,16 +135,29 @@ class VoiceDaemon:
             log.info("muted (volume 0), not speaking: %s", text[:60])
             return
         epoch = self._interrupt_epoch
+        audio = None
         try:
-            wav, sample_rate = self.engine.synthesize(text, voice=voice)
+            audio = self.engine.synthesize(text, voice=voice)
         except SynthesisError as e:
             log.warning("synthesis failed — using fallback: %s", e)
+        if not self._survives_pause(epoch) or self._interrupt_epoch != epoch:
+            log.info("dropped superseded line (ended before playback): %s", text[:60])
+            return
+        if self.volume <= 0:
+            log.info("muted (volume 0) before playback, dropping: %s", text[:60])
+            return
+        if audio is None:
             self._speak_fallback(text)
-            return
-        if self._interrupt_epoch != epoch:
-            log.info("dropped superseded line (interrupted mid-synthesis): %s", text[:60])
-            return
-        self._play(wav, sample_rate, text)
+        else:
+            wav, sample_rate = audio
+            self._play(wav, sample_rate, text, epoch)
+
+    def _survives_pause(self, epoch: int) -> bool:
+        """Block while paused; False if the line was ended in the meantime."""
+        while not self._unpaused.wait(PAUSE_POLL_SEC):
+            if self._interrupt_epoch != epoch:
+                return False
+        return True
 
     def _render_sync(self, text: str, voice: str | None,
                      render_path: str) -> None:
@@ -163,55 +197,67 @@ class VoiceDaemon:
         log.info("rendered (%dHz, %.1fs): %s -> %s",
                  sample_rate, len(wav) / sample_rate, text[:60], render_path)
 
-    def _play(self, wav, sample_rate: int, text: str) -> None:
+    def _play(self, wav, sample_rate: int, text: str, epoch: int) -> None:
         import soundfile as sf
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 sf.write(f.name, wav, sample_rate)
                 tmp_path = f.name
-            argv = self._render_player_argv(tmp_path)
-            proc = subprocess.Popen(
-                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            # Track the player so an interrupt can kill it mid-line.
-            with self._player_lock:
-                self._current_player = proc
-            # cfg.max_playback_seconds is a HANG-PROTECTION FLOOR, not a cap on
-            # legitimate content: a fixed ceiling here would silently kill
-            # mid-playback the moment a long ("book"-length) line's audio
-            # outran it. The real timeout is however long this clip actually
-            # runs, plus headroom for player startup/seek overhead; the config
-            # value only sets a minimum so short clips still get hang
-            # protection even when duration is ~0.
+            playback = self._spawn_player(self._render_player_argv(tmp_path), epoch)
+            if playback is None:
+                log.info("dropped superseded line (ended before playback): %s", text[:60])
+                self._unlink(tmp_path)
+                return
             duration_seconds = len(wav) / sample_rate if sample_rate else 0.0
-            timeout = max(self.cfg.max_playback_seconds, duration_seconds + 30.0)
-            self._ducker.acquire(proc.pid)
+            hang_limit = max(self.cfg.max_playback_seconds,
+                             duration_seconds + PLAYBACK_HEADROOM_SEC)
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                playback.start()
+                playback.wait(hang_limit)
             finally:
-                self._ducker.release()
-            with self._player_lock:
-                if self._current_player is proc:
-                    self._current_player = None
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            if proc.returncode == 0:
+                playback.finish()
+                with self._player_lock:
+                    if self._current_player is playback:
+                        self._current_player = None
+                self._unlink(self._ipc_path)
+            self._unlink(tmp_path)
+            if playback.returncode == 0:
                 log.info("spoke (%dHz, %.1fs): %s",
                          sample_rate, len(wav) / sample_rate, text[:60])
             else:
                 log.info("playback cut short (player rc=%s): %s",
-                         proc.returncode, text[:60])
+                         playback.returncode, text[:60])
         except Exception as e:
             log.warning("audio playback failed — using fallback: %s", e)
             self._speak_fallback(text)
 
+    def _spawn_player(self, argv: list[str], epoch: int) -> Playback | None:
+        """Start the player and register it as current; None if an interrupt
+        superseded the line."""
+        control = MpvControl(self._ipc_path) if self._player_has_ipc else None
+        with self._player_lock:
+            if self._interrupt_epoch != epoch:
+                return None
+            self._unlink(self._ipc_path)
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self._current_player = Playback(proc, control, self._ducker, self._mix)
+            return self._current_player
+
+    def _mix(self) -> Mix:
+        return Mix(self.volume, self._paused)
+
+    @staticmethod
+    def _unlink(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def _render_player_argv(self, wav_path: str) -> list[str]:
-        argv = [a.format(file=wav_path, volume=self.volume) for a in self.cfg.player]
+        argv = [a.format(file=wav_path, volume=self.volume, ipc=self._ipc_path)
+                for a in self.cfg.player]
         if not any("{file}" in a for a in self.cfg.player):
             argv.append(wav_path)  # tolerate templates without a {file} slot
         return argv
@@ -231,11 +277,15 @@ class VoiceDaemon:
     def _kill_current_player(self) -> bool:
         """Terminate in-flight playback, if any. Thread-safe."""
         with self._player_lock:
-            proc = self._current_player
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            return True
-        return False
+            playback = self._current_player
+        return playback is not None and playback.terminate()
+
+    def _sync_player(self) -> None:
+        """Push the current volume and pause state into the playing line."""
+        with self._player_lock:
+            playback = self._current_player
+        if playback is not None:
+            playback.apply()
 
     # ── async plumbing ─────────────────────────────────────────────────────
 
@@ -243,32 +293,32 @@ class VoiceDaemon:
         """Drain the queue one line at a time; ack each client when spoken."""
         while not self._stop.is_set():
             try:
-                text, voice, render_path, writer = await asyncio.wait_for(
-                    self._queue.get(), timeout=1.0
-                )
+                line = await asyncio.wait_for(self._queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             self._busy = True
+            self._current_line = line
+            self._current_started = time.monotonic()
             try:
-                if render_path is not None:
+                if line.render_path is not None:
                     await loop.run_in_executor(
-                        None, self._render_sync, text, voice, render_path
+                        None, self._render_sync, line.text, line.voice, line.render_path
                     )
                 else:
-                    await loop.run_in_executor(None, self._speak_sync, text, voice)
+                    await loop.run_in_executor(None, self._speak_sync, line.text, line.voice)
             except Exception:
                 # _speak_sync/_render_sync handle their own fallbacks; this
                 # guards the worker task against anything unexpected so the
                 # queue never stalls.
-                log.exception("unexpected error while speaking %r", text[:60])
+                log.exception("unexpected error while speaking %r", line.text[:60])
             self._busy = False
+            self._current_line = None
             try:
-                writer.write(protocol.ACK)
-                await writer.drain()
-                writer.close()
+                line.writer.write(protocol.ACK)
+                await line.writer.drain()
+                line.writer.close()
             except Exception:
                 pass  # fire-and-forget client already hung up
-            self._queue.task_done()
 
     async def _interrupt(self, text: str, writer: asyncio.StreamWriter,
                          voice: str | None = None,
@@ -277,35 +327,51 @@ class VoiceDaemon:
         drained, killed = self._cut_off()
         log.info("[interrupt] drained %d queued, stopped current=%s: %s",
                  drained, killed, text[:60])
-        await self._queue.put((text, voice, render_path, writer))
+        self._queue.put(text, voice, render_path, writer)
+
+    def _end_current_line(self) -> bool:
+        """End the line being synthesized or played; returns whether a player was killed."""
+        self._interrupt_epoch += 1
+        return self._kill_current_player()
+
+    def _drop_queued(self) -> int:
+        lines = self._queue.drain()
+        for line in lines:
+            self._close(line)
+        return len(lines)
+
+    @staticmethod
+    def _close(line: Line) -> None:
+        try:
+            line.writer.close()
+        except Exception:
+            pass
 
     def _cut_off(self) -> tuple[int, bool]:
         """Drain the queue and stop playback; returns (drained, player killed)."""
-        self._interrupt_epoch += 1  # marks any in-flight synthesis as superseded
-        drained = 0
-        while True:
-            try:
-                (_old_text, _old_voice, _old_render_path,
-                 old_writer) = self._queue.get_nowait()
-                self._queue.task_done()
-                drained += 1
-                try:
-                    old_writer.close()
-                except Exception:
-                    pass
-            except asyncio.QueueEmpty:
-                break
-        return drained, self._kill_current_player()
+        return self._drop_queued(), self._end_current_line()
 
-    def _status_json(self) -> bytes:
+    @staticmethod
+    def _preview(line: Line, **extra) -> dict:
+        return {"id": line.id, "voice": line.voice,
+                "text": line.text[:protocol.PREVIEW_CHARS], **extra}
+
+    # control messages
+
+    async def _ctl_status(self, _arg: str) -> bytes:
         cfg = self.cfg
-        player = self._current_player
+        playback = self._current_player
+        current = self._current_line
         return (json.dumps({
             "ready": self.engine.is_ready(),
             "volume": self.volume,
-            "queued": self._queue.qsize(),
+            "queued": len(self._queue),
             "busy": self._busy,
-            "speaking": player is not None and player.poll() is None,
+            "speaking": playback is not None and playback.alive,
+            "paused": self._paused,
+            "current": None if current is None else self._preview(
+                current, elapsed_sec=round(time.monotonic() - self._current_started, 1)),
+            "queue": [self._preview(line) for line in self._queue.snapshot()],
             "ducking": {
                 "enabled": cfg.duck_enabled,
                 "factor": cfg.duck_factor,
@@ -315,7 +381,7 @@ class VoiceDaemon:
             },
         }) + "\n").encode()
 
-    def _reload_ducking(self) -> bytes:
+    async def _ctl_reload(self, _arg: str) -> bytes:
         try:
             fresh = load_config(self.cfg.source_file or None)
         except Exception as e:
@@ -334,6 +400,65 @@ class VoiceDaemon:
         log.info("[reload] ducking enabled=%s factor=%s hold_ms=%s",
                  self.cfg.duck_enabled, self.cfg.duck_factor, self.cfg.duck_hold_ms)
         return protocol.ACK
+
+    async def _ctl_stop(self, _arg: str) -> bytes:
+        drained, killed = self._cut_off()
+        self._set_paused(False)
+        log.info("[stop] drained %d queued, stopped current=%s", drained, killed)
+        return protocol.ACK
+
+    async def _ctl_skip(self, _arg: str) -> bytes:
+        killed = self._end_current_line()
+        log.info("[skip] ended current line, player stopped=%s", killed)
+        return protocol.ACK
+
+    async def _ctl_pause(self, _arg: str) -> bytes:
+        self._set_paused(True)
+        await self._push_to_player()
+        return protocol.ACK
+
+    async def _ctl_resume(self, _arg: str) -> bytes:
+        self._set_paused(False)
+        await self._push_to_player()
+        return protocol.ACK
+
+    def _set_paused(self, paused: bool) -> None:
+        if paused == self._paused:
+            return
+        self._paused = paused
+        if paused:
+            self._unpaused.clear()
+        else:
+            self._unpaused.set()
+        log.info("[%s]", "pause" if paused else "resume")
+
+    async def _push_to_player(self) -> None:
+        await asyncio.get_running_loop().run_in_executor(None, self._sync_player)
+
+    async def _ctl_clear(self, _arg: str) -> bytes:
+        log.info("[clear] dropped %d queued", self._drop_queued())
+        return protocol.ACK
+
+    async def _ctl_drop(self, arg: str) -> bytes:
+        try:
+            line_id = int(arg)
+        except ValueError:
+            return f"ERR not a line id: {arg!r}\n".encode()
+        line = self._queue.remove(line_id)
+        if line is None:
+            return f"ERR no queued line {line_id}\n".encode()
+        self._close(line)
+        log.info("[drop] line %d: %s", line_id, line.text[:60])
+        return protocol.ACK
+
+    async def _ctl_volume(self, arg: str) -> None:
+        try:
+            self.volume = protocol.clamp_volume(int(arg))
+        except ValueError:
+            return None
+        log.info("[volume] set to %d", self.volume)
+        await self._push_to_player()
+        return None
 
     async def _idle_offload(self, loop: asyncio.AbstractEventLoop) -> None:
         """Move the model off the GPU after ``keepalive_seconds`` of quiet."""
@@ -386,6 +511,16 @@ class VoiceDaemon:
             except asyncio.TimeoutError:
                 pass
 
+    @staticmethod
+    async def _reply(writer: asyncio.StreamWriter, reply: bytes | None) -> None:
+        if reply is not None:
+            try:
+                writer.write(reply)
+                await writer.drain()
+            except Exception:
+                pass
+        writer.close()
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             data = await asyncio.wait_for(reader.readline(), timeout=READLINE_TIMEOUT_SEC)
@@ -394,42 +529,13 @@ class VoiceDaemon:
                 writer.close()
                 return
             if text.startswith(protocol.PING_MARKER):
-                reply = protocol.PING_READY if self.engine.is_ready() else protocol.PING_STARTING
-                try:
-                    writer.write(reply)
-                    await writer.drain()
-                except Exception:
-                    pass
-                writer.close()
+                await self._reply(writer, protocol.PING_READY if self.engine.is_ready()
+                                  else protocol.PING_STARTING)
                 return
-            if text.startswith((protocol.STATUS_MARKER, protocol.RELOAD_MARKER,
-                                protocol.STOP_MARKER)):
-                if text.startswith(protocol.STATUS_MARKER):
-                    reply = self._status_json()
-                elif text.startswith(protocol.RELOAD_MARKER):
-                    reply = self._reload_ducking()
-                else:
-                    drained, killed = self._cut_off()
-                    log.info("[stop] drained %d queued, stopped current=%s",
-                             drained, killed)
-                    reply = protocol.ACK
-                try:
-                    writer.write(reply)
-                    await writer.drain()
-                except Exception:
-                    pass
-                writer.close()
-                return
-            if text.startswith(protocol.VOLUME_MARKER):
-                try:
-                    self.volume = protocol.clamp_volume(
-                        int(text[len(protocol.VOLUME_MARKER):])
-                    )
-                    log.info("[volume] set to %d", self.volume)
-                except ValueError:
-                    pass
-                writer.close()
-                return
+            for marker, control in self._controls.items():
+                if text.startswith(marker):
+                    await self._reply(writer, await control(text[len(marker):]))
+                    return
 
             # Strip the interrupt prefix (outermost), then the render prefix,
             # then the voice prefix -- the same nesting order encode_speak /
@@ -465,7 +571,7 @@ class VoiceDaemon:
                 await self._interrupt(text, writer, voice=voice,
                                       render_path=render_path)
             else:
-                await self._queue.put((text, voice, render_path, writer))
+                self._queue.put(text, voice, render_path, writer)
         except Exception:
             writer.close()
 
@@ -491,7 +597,7 @@ class VoiceDaemon:
                 pass
 
     async def run(self) -> None:
-        self._queue = asyncio.Queue()
+        self._queue = LineQueue()
         self._stop = asyncio.Event()
         loop = asyncio.get_running_loop()
 
@@ -509,6 +615,8 @@ class VoiceDaemon:
         os.chmod(self.cfg.socket_path, self.cfg.socket_mode)
         log.info("voxcaster %s ready  voice=%s  socket=%s",
                  __version__, self.cfg.voice, self.cfg.socket_path)
+        if not self._player_has_ipc:
+            log.info("audio.player has no {ipc}: volume and pause cannot reach a line already playing")
         # Under Type=notify, systemd holds the unit in "activating" until
         # this arrives — sent only now, with the socket actually listening,
         # so "active (running)" is never claimed for a daemon that can't
@@ -550,6 +658,7 @@ class VoiceDaemon:
             await self._stop.wait()
 
         _sd_notify("STOPPING=1")
+        self._end_current_line()
         await loop.run_in_executor(None, self._ducker.shutdown)
         for task in (worker_task, offload_task, watchdog_task):
             task.cancel()

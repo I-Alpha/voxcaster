@@ -193,11 +193,12 @@ class Ducker:
     def acquire(self, own_pid: int) -> None:
         """Pin the player's own stream to nominal volume and, when enabled,
         duck everything else. Calls nest."""
-        self._duck_others(own_pid)
+        self.duck(own_pid)
         self._pin_player(own_pid)
 
     @_never_raises
-    def _duck_others(self, own_pid: int) -> None:
+    def duck(self, own_pid: int) -> None:
+        """Duck every stream except ``own_pid``. Each call needs a :meth:`release`."""
         if not self._enabled:
             return
         with self._lock:
