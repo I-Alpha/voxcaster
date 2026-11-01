@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1] - 2026-11-01
+
+### Fixed
+- Ducking no longer compounds. A stream that dies while ducked leaves the
+  ducked level under the app's restore key, and the server gives that level
+  to the app's next stream. The duck remembers such levels (also across
+  restarts) so a reborn stream is never taken to be at its "original" and
+  ducked again, and lifts it back if it appears while nothing is ducked. Each
+  restore is read back and retried once, with a warning if it still does not
+  take.
 
 ### Added
 - Live control of the line already playing. `VOLUME` (and the tray volume
@@ -51,12 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Originals are written to `$XDG_RUNTIME_DIR/voxcaster-duck.json` before any
     change, and a stale duck is undone at daemon start, so a crash cannot leave
     audio dimmed.
-  - A stream that dies while ducked leaves the ducked level under the app's
-    restore key, and the server gives that level to the app's next stream. The
-    duck remembers such levels (also across restarts) so a reborn stream is
-    never taken to be at its "original" and ducked again, and lifts it back if
-    it appears while nothing is ducked. Each restore is read back and retried
-    once, with a warning if it still does not take.
 - **The player stream is pinned to 100% and unmuted** after it spawns. The
   server restores a new stream's volume by media role, which other streams'
   volume changes (ducking included) overwrite, so the voice could start
