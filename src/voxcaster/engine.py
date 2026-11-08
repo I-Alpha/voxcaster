@@ -17,16 +17,25 @@ Device policies:
     (e.g. another process holds all VRAM), synthesis continues on the CPU
     for that request instead of erroring.
 
-All device moves and synthesis calls are serialised by an internal lock,
+One Kokoro pipeline (a private model plus the language's G2P, about 0.5 GB of
+RAM) is kept per voice language. At most ``max_resident_pipelines`` stay
+loaded, least recently used evicted first, and a pipeline unused for
+``idle_unload_seconds`` is unloaded; both return the freed heap to the OS.
+
+All device moves, evictions and synthesis calls are serialised by an internal lock,
 so the idle-offload timer can never move the model mid-synthesis.
 """
 from __future__ import annotations
 
+import ctypes
+import gc
 import logging
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 
 import numpy as np
 
@@ -43,6 +52,30 @@ class SynthesisError(RuntimeError):
     """
 
 
+KOKORO_LANG_CODES = "abefhijpz"
+
+
+def load_kokoro_pipeline(lang: str):
+    """Construct a Kokoro pipeline for ``lang`` on the CPU."""
+    from kokoro import KPipeline
+    return KPipeline(lang_code=lang, device="cpu")
+
+
+def release_freed_memory() -> None:
+    """Hand freed heap back to the OS (collect garbage, drop the CUDA cache, ``malloc_trim``)."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        log.warning("torch.cuda.empty_cache() failed: %s", e)
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        log.warning("malloc_trim unavailable; freed heap stays with the process")
+
+
 class KokoroEngine:
     def __init__(
         self,
@@ -52,34 +85,34 @@ class KokoroEngine:
         lang_code: str = "a",
         policy: str = "auto",
         keepalive_seconds: int = 180,
+        max_resident_pipelines: int = 2,
+        idle_unload_seconds: float = 600.0,
+        pipeline_factory: Callable[[str], object] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if max_resident_pipelines < 1:
+            raise ValueError(f"max_resident_pipelines must be >= 1, got {max_resident_pipelines}")
+        if idle_unload_seconds <= 0:
+            raise ValueError(f"idle_unload_seconds must be > 0, got {idle_unload_seconds}")
         self.voice = voice
         self.speed = speed
         self.lang_code = lang_code
         self.keepalive_seconds = keepalive_seconds
+        self.max_resident_pipelines = max_resident_pipelines
+        self.idle_unload_seconds = idle_unload_seconds
+        self._pipeline_factory = pipeline_factory or load_kokoro_pipeline
+        self._clock = clock
 
         # Lock protecting ALL device moves and synthesis calls. A plain
         # threading.Lock is correct here: synthesis runs in a thread executor,
         # and the idle-offload path also runs in an executor, never on the
         # asyncio event loop itself.
         self._lock = threading.Lock()
-        # lang_code -> KPipeline. A KPipeline is bound to one lang_code at
-        # construction, and a per-request voice can be from either family, so a
-        # single slot means every cross-family voice swap is a full rebuild.
-        # ⊨ MEASURED 2026-07-30: rebuild costs 2807ms (lang a) / 2320ms (lang b),
-        #   and daemon.log recorded 167 `voice lang_code changed` events, i.e.
-        #   ~428s of pure reconstruction, plus a forced CPU->GPU move each time
-        #   because the rebuild reset the device flag. Worse than the cost: a
-        #   report ends up delivered in alternating voices AND accents
-        #   (American af_heart vs British bf_emma), which is what "the voice
-        #   sounds robotic" actually was. Per-clip logs all reported success
-        #   with a plausible duration, so it was invisible.
-        # Bounded by construction: _lang_for_voice only ever returns 'a' or 'b',
-        # so the cache holds at most 2 Kokoro-82M models (~660MB fp32 total).
-        self._pipelines: dict[str, object] = {}
+        self._pipelines: OrderedDict[str, object] = OrderedDict()  # least recently used first
+        self._pipeline_last_used: dict[str, float] = {}
         # lang_codes whose model currently sits on the GPU (holding VRAM).
         self._gpu_langs: set[str] = set()
-        self._last_used = 0.0  # time.monotonic() of the last completed request
+        self._last_used = 0.0  # self._clock() of the last completed request
 
         if policy == "cpu":
             # Hide CUDA before torch is ever imported.
@@ -106,13 +139,12 @@ class KokoroEngine:
 
     @staticmethod
     def _lang_for_voice(voice: str | None) -> str:
-        """Kokoro lang_code implied by a voice id ('a'=American, 'b'=British).
+        """Kokoro lang_code implied by a voice id.
 
-        Voice ids are ``<lang><gender>_<name>`` (af_heart, bm_george). Anything
-        unrecognised falls back to 'a', which is also what the pipeline default
-        would have been.
+        Voice ids are ``<lang><gender>_<name>`` (af_heart, bm_george, ef_dora).
+        Anything unrecognised falls back to 'a'.
         """
-        return voice[0] if voice and voice[0] in ("a", "b") else "a"
+        return voice[0] if voice and voice[0] in KOKORO_LANG_CODES else "a"
 
     @property
     def on_gpu(self) -> bool:
@@ -131,30 +163,70 @@ class KokoroEngine:
         line has been spoken."""
         return bool(self._pipelines)
 
+    def resident_langs(self) -> list[str]:
+        """Languages with a loaded pipeline, least recently used first."""
+        return list(self._pipelines)
+
+    def idle_unload_due(self) -> bool:
+        """Whether some pipeline has been unused for ``idle_unload_seconds`` (lock-free read)."""
+        now = self._clock()
+        return any(now - used >= self.idle_unload_seconds
+                   for used in list(self._pipeline_last_used.values()))
+
+    def unload_idle(self) -> list[str]:
+        """Unload every pipeline unused for ``idle_unload_seconds``; returns their languages.
+
+        Takes the synthesis lock, so a pipeline is never unloaded mid-render."""
+        with self._lock:
+            now = self._clock()
+            idle = [lang for lang in self._pipelines
+                    if now - self._pipeline_last_used[lang] >= self.idle_unload_seconds]
+            for lang in idle:
+                self._evict_locked(lang)
+            if idle:
+                release_freed_memory()
+                log.info("unloaded idle pipelines %s (unused >= %gs); resident now %s",
+                         idle, self.idle_unload_seconds, self.resident_langs())
+            return idle
+
     def idle_seconds(self) -> float:
         """Seconds since the last completed synthesis request."""
-        return time.monotonic() - self._last_used
+        return self._clock() - self._last_used
+
+    def _evict_locked(self, lang: str) -> None:
+        """Drop ``lang``'s pipeline and its GPU residency record. Lock must be held."""
+        del self._pipelines[lang]
+        del self._pipeline_last_used[lang]
+        self._gpu_langs.discard(lang)
 
     def _pipeline_locked(self, lang: str):
-        """Cached KPipeline for ``lang``, constructing it once. Lock must be held.
+        """Resident pipeline for ``lang``, loading it if absent. Lock must be held.
 
-        This is the whole point of the cache: a cross-family voice swap must be
-        a dict lookup, not a 2.3-2.8s reconstruction that also drops the model
-        back to the CPU.
+        Marks ``lang`` most recently used. A load first evicts least recently
+        used pipelines until fewer than ``max_resident_pipelines`` remain, so
+        the cap holds during the load too.
         """
         pipe = self._pipelines.get(lang)
-        if pipe is not None:
-            return pipe
-        try:
-            from kokoro import KPipeline
-            # Always construct on CPU — moved to GPU per-request by policy.
-            pipe = KPipeline(lang_code=lang, device="cpu")
-        except Exception as e:
-            raise SynthesisError(
-                f"failed to load Kokoro pipeline (lang_code={lang!r}): {e}") from e
-        self._pipelines[lang] = pipe
-        log.info("Kokoro pipeline constructed for lang_code=%r on CPU; cache now %s",
-                 lang, sorted(self._pipelines))
+        if pipe is None:
+            evicted = []
+            while len(self._pipelines) >= self.max_resident_pipelines:
+                oldest = next(iter(self._pipelines))
+                self._evict_locked(oldest)
+                evicted.append(oldest)
+            if evicted:
+                release_freed_memory()
+                log.info("evicted least recently used pipelines %s (cap %d)",
+                         evicted, self.max_resident_pipelines)
+            try:
+                pipe = self._pipeline_factory(lang)
+            except Exception as e:
+                raise SynthesisError(
+                    f"failed to load Kokoro pipeline (lang_code={lang!r}): {e}") from e
+            self._pipelines[lang] = pipe
+            log.info("Kokoro pipeline constructed for lang_code=%r on CPU; resident now %s",
+                     lang, self.resident_langs())
+        self._pipelines.move_to_end(lang)
+        self._pipeline_last_used[lang] = self._clock()
         return pipe
 
     def _to_gpu_locked(self, lang: str) -> bool:
@@ -214,7 +286,7 @@ class KokoroEngine:
         with self._lock:
             if not self._gpu_langs:
                 return False
-            idle = time.monotonic() - self._last_used
+            idle = self._clock() - self._last_used
             if idle < self.keepalive_seconds:
                 return False
             log.info("idle %.0fs >= %ds keepalive — offloading model(s) to CPU",
@@ -314,11 +386,6 @@ class KokoroEngine:
                         voice, self.voice)
         lang = self._lang_for_voice(voice)
         with self._lock:
-            # Voice lang_code switching: a KPipeline is bound to one lang_code
-            # ('a'=American, 'b'=British) at construction, so a voice from the
-            # other family needs that family's pipeline — otherwise the line is
-            # spoken with the wrong accent/phoneme model. Previously this
-            # RECONSTRUCTED the pipeline every swap; now it is a cache lookup.
             if lang != self.lang_code:
                 log.info("active lang_code %s->%s (voice=%s) — %s",
                          self.lang_code, lang, voice,
@@ -353,5 +420,7 @@ class KokoroEngine:
             finally:
                 # Stamp even on failure so the offload timer measures real
                 # activity, not just successes.
-                self._last_used = time.monotonic()
+                self._last_used = self._clock()
+                if lang in self._pipeline_last_used:
+                    self._pipeline_last_used[lang] = self._last_used
         return wav, sample_rate

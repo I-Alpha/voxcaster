@@ -23,6 +23,14 @@ lang_code = "a"
 # Makes raw LLM/CLI output safe to pipe straight into `speak`. Default: true.
 markdown_preprocess = true
 
+# Kokoro pipelines (one per voice language, about 0.5 GB of RAM each) kept
+# loaded. Loading another evicts the least recently used one.
+max_resident_pipelines = 2
+
+# A pipeline unused for this many seconds is unloaded and its memory returned
+# to the OS; the next line in that language reloads it (a few seconds).
+idle_unload_seconds = 600
+
 [device]
 # "auto" — dynamic offload (recommended): load on CPU, hop to the GPU for
 #          synthesis bursts, release VRAM after `keepalive_seconds` idle.

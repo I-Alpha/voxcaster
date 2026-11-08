@@ -10,7 +10,8 @@ Design
 - An interrupt request drains everything queued, kills in-flight playback,
   and jumps its own text to the front.
 - An idle timer offloads the model from GPU to CPU after a configurable
-  keepalive, releasing VRAM for other workloads (see :mod:`voxcaster.engine`).
+  keepalive, releasing VRAM for other workloads, and unloads Kokoro pipelines
+  unused for ``idle_unload_seconds`` (see :mod:`voxcaster.engine`).
 - A flock(2) singleton guarantees at most one daemon per socket path, so
   clients may race to auto-spawn it without harm.
 - If synthesis or playback fails, the line is spoken through a configurable
@@ -84,6 +85,8 @@ class VoiceDaemon:
             lang_code=cfg.lang_code,
             policy=cfg.device,
             keepalive_seconds=cfg.keepalive_seconds,
+            max_resident_pipelines=cfg.max_resident_pipelines,
+            idle_unload_seconds=cfg.idle_unload_seconds,
         )
         self.volume = protocol.clamp_volume(cfg.volume)
         self._ducker = Ducker(
@@ -460,23 +463,26 @@ class VoiceDaemon:
         await self._push_to_player()
         return None
 
-    async def _idle_offload(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Move the model off the GPU after ``keepalive_seconds`` of quiet."""
-        if not self.engine.dynamic_offload:
-            return
-        poll = min(30.0, max(1.0, self.engine.keepalive_seconds / 4))
+    async def _idle_maintenance(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Offload the model from the GPU after ``keepalive_seconds`` of quiet and
+        unload pipelines unused for ``idle_unload_seconds``."""
+        engine = self.engine
+        period = engine.idle_unload_seconds
+        if engine.dynamic_offload:
+            period = min(period, engine.keepalive_seconds)
+        poll = min(30.0, max(1.0, period / 4))
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=poll)
                 break  # stop requested
             except asyncio.TimeoutError:
                 pass
-            if not self.engine.on_gpu:
-                continue
-            if self.engine.idle_seconds() >= self.engine.keepalive_seconds:
-                # Run in an executor: maybe_offload waits on the model lock,
-                # which a synthesis may hold — never block the event loop.
-                await loop.run_in_executor(None, self.engine.maybe_offload)
+            # Executor calls: both wait on the model lock, which a synthesis
+            # may hold, and must never block the event loop.
+            if engine.on_gpu and engine.idle_seconds() >= engine.keepalive_seconds:
+                await loop.run_in_executor(None, engine.maybe_offload)
+            if engine.idle_unload_due():
+                await loop.run_in_executor(None, engine.unload_idle)
 
     async def _watchdog_heartbeat(self) -> None:
         """Ping systemd's watchdog from INSIDE the event loop.
@@ -632,7 +638,7 @@ class VoiceDaemon:
             loop.add_signal_handler(sig, _shutdown, sig)
 
         worker_task = asyncio.create_task(self._worker(loop))
-        offload_task = asyncio.create_task(self._idle_offload(loop))
+        maintenance_task = asyncio.create_task(self._idle_maintenance(loop))
         watchdog_task = asyncio.create_task(self._watchdog_heartbeat())
 
         # asyncio swallows task exceptions by default (surfacing them only
@@ -660,7 +666,7 @@ class VoiceDaemon:
         _sd_notify("STOPPING=1")
         self._end_current_line()
         await loop.run_in_executor(None, self._ducker.shutdown)
-        for task in (worker_task, offload_task, watchdog_task):
+        for task in (worker_task, maintenance_task, watchdog_task):
             task.cancel()
             try:
                 await task

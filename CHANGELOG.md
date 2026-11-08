@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- At most `tts.max_resident_pipelines` (default 2) Kokoro pipelines stay in
+  RAM; loading another evicts the least recently used. A pipeline unused for
+  `tts.idle_unload_seconds` (default 600) is unloaded, and its freed heap is
+  returned to the OS. A voice id's language prefix (`e`, `f`, `h`, `i`, `j`,
+  `p`, `z`, as well as `a` and `b`) now selects that language's pipeline.
+
 ## [0.5.2] - 2026-11-01
 
 ### Added

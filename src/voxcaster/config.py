@@ -80,6 +80,8 @@ class Config:
 
     # [tts] (cont.)
     markdown_preprocess: bool = True  # strip markdown / extract TTS_SUMMARY before synthesis
+    max_resident_pipelines: int = 2   # Kokoro pipelines (one per language) kept in RAM
+    idle_unload_seconds: float = 600.0  # unused seconds before a pipeline is unloaded
 
     # [device]
     device: str = "auto"            # "cpu" | "gpu" | "auto" (dynamic offload)
@@ -156,6 +158,8 @@ _FILE_KEYS = [
     ("tts", "speed", "speed", float),
     ("tts", "lang_code", "lang_code", str),
     ("tts", "markdown_preprocess", "markdown_preprocess", _as_bool),
+    ("tts", "max_resident_pipelines", "max_resident_pipelines", int),
+    ("tts", "idle_unload_seconds", "idle_unload_seconds", float),
     ("device", "policy", "device", str),
     ("device", "keepalive_seconds", "keepalive_seconds", int),
     ("daemon", "socket_path", "socket_path", str),
@@ -229,6 +233,11 @@ def load_config(path: str | None = None) -> Config:
         raise ValueError(
             f"device policy must be one of {VALID_DEVICE_POLICIES}, got {cfg.device!r}"
         )
+    if cfg.max_resident_pipelines < 1:
+        raise ValueError(
+            f"[tts] max_resident_pipelines must be >= 1, got {cfg.max_resident_pipelines}")
+    if cfg.idle_unload_seconds <= 0:
+        raise ValueError(f"[tts] idle_unload_seconds must be > 0, got {cfg.idle_unload_seconds}")
     if not 0.0 <= cfg.duck_factor <= 1.0:
         raise ValueError(f"[ducking] factor must be within 0..1, got {cfg.duck_factor}")
     if min(cfg.duck_fade_down_ms, cfg.duck_fade_up_ms, cfg.duck_hold_ms) < 0:

@@ -167,6 +167,8 @@ file; CLI flags override both.
 | `tts.voice` | `VOXCASTER_VOICE` | `af_heart` | Kokoro voice id (`af_*`, `am_*`, `bf_*`, `bm_*`, ...) |
 | `tts.speed` | `VOXCASTER_SPEED` | `1.0` | Speech-rate multiplier |
 | `tts.lang_code` | `VOXCASTER_LANG` | `a` | Kokoro language code (`a` US English, `b` UK English) |
+| `tts.max_resident_pipelines` | — | `2` | Kokoro pipelines (one per language, about 0.5 GB RAM each) kept loaded; least recently used evicted first |
+| `tts.idle_unload_seconds` | — | `600` | Unused seconds before a pipeline is unloaded; the next line for that language reloads it |
 | `device.policy` | `VOXCASTER_DEVICE` | `auto` | `auto` (dynamic offload) / `cpu` / `gpu` |
 | `device.keepalive_seconds` | `VOXCASTER_KEEPALIVE` | `180` | Idle seconds before GPU→CPU offload |
 | `daemon.socket_path` | `VOXCASTER_SOCKET` | `$XDG_RUNTIME_DIR/voxcaster.sock` | Unix socket path |
