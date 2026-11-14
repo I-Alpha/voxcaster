@@ -185,6 +185,9 @@ class Ducker:
         # Ducked levels left under a restore key by a stream that died ducked:
         # the server hands them to the next stream with that key.
         self._residue: dict[str, tuple[Ducked, float]] = {}
+        # Entries whose restore the server has not yet shown to have taken, with
+        # their give-up time. They stay in the state file and are retried.
+        self._pending: dict[int, tuple[Ducked, float]] = {}
         self._poller_running = False
         self._wake = threading.Condition(self._lock)
 
@@ -207,6 +210,7 @@ class Ducker:
             self._own_pids.add(own_pid)
             self._active = True
             self._start_poller()
+            self._settle_pending()
             self._duck_new_streams()
 
     @_never_raises
@@ -232,6 +236,8 @@ class Ducker:
             self._holders = 0
             if self._active:
                 self._restore_all()
+            else:
+                self._settle_pending()
 
     @_never_raises
     def reconfigure(self, *, factor: float, fade_down_sec: float, fade_up_sec: float,
@@ -254,6 +260,7 @@ class Ducker:
         streams that appeared since the last look."""
         with self._lock:
             if not self._active:
+                self._settle_pending()
                 self._repair_residue()
                 return
             if self._release_at is not None and self._clock() >= self._release_at:
@@ -269,19 +276,9 @@ class Ducker:
             for entry in residue:
                 self._remember_residue(entry)
             if entries:
-                streams = self._pactl.sink_inputs()
-                claimed: set[int] = set()
-                for entry in entries:
-                    match = self._recovery_match(entry, streams, claimed)
-                    if match is None:
-                        self._remember_residue(entry)
-                        continue
-                    claimed.add(match.index)
-                    self._pactl.set_volume(match.index, entry.original)
-                    log.info("recovered stale duck on stream %d (%s)",
-                             match.index, match.app)
+                self._restore(entries, self._pactl.sink_inputs())
             self._save_state()
-            if self._residue:
+            if self._lingering():
                 self._start_poller()
 
     # ── ducking ───────────────────────────────────────────────────────────
@@ -367,45 +364,97 @@ class Ducker:
         self._release_at = None
         self._wake.notify_all()
         self._own_pids.clear()
-        entries, self._ducked = self._ducked, {}
+        entries, self._ducked = list(self._ducked.values()), {}
         try:
+            try:
+                streams = self._pactl.sink_inputs()
+            except PactlError as e:
+                log.warning("cannot list streams to restore, restoring blind: %s", e)
+                streams = [Stream(x.index, x.ducked, False, None, x.app, x.restore_id)
+                           for x in entries]
+            self._restore(entries, streams)
+        finally:
+            self._save_state()
+            if self._lingering():
+                self._start_poller()
+
+    def _settle_pending(self) -> None:
+        now = self._clock()
+        for index in [i for i, (_, expires) in self._pending.items() if expires <= now]:
+            log.warning("giving up restoring stream %d", index)
+            del self._pending[index]
+        if self._pending:
+            self._restore([e for e, _ in self._pending.values()],
+                          self._pactl.sink_inputs())
+            self._save_state()
+
+    def _restore(self, entries: list[Ducked], streams: list[Stream]) -> None:
+        """Put each entry's stream back to its original. A stream is found by
+        index and app, or by restore key when it was re-created mid-duck and
+        inherited the ducked level. An entry stays pending, and in the state
+        file, until the server shows its streams back at the original."""
+        entry_indexes = {e.index for e in entries}
+        claimed: set[int] = set()
+        moves: dict[int, tuple[Volume, Volume]] = {}
+        owner: dict[int, int] = {}
+        for entry in entries:
+            found = self._matches(entry, streams, claimed, entry_indexes)
+            if not found:
+                self._pending.pop(entry.index, None)
+                if any(s.index == entry.index and s.app == entry.app for s in streams):
+                    log.info("stream %d volume changed during speech; leaving it",
+                             entry.index)
+                else:
+                    self._remember_residue(entry)
+                continue
+            self._pending.setdefault(entry.index,
+                                     (entry, self._clock() + RESIDUE_TTL_SEC))
+            for s in found:
+                claimed.add(s.index)
+                moves[s.index] = (s.volume, entry.original)
+                owner[s.index] = entry.index
+        self._save_state()
+        self._fade(moves, self._fade_up)
+        wrong = self._verify_restored({i: end for i, (_, end) in moves.items()})
+        stuck = {owner[i] for i in wrong}
+        for index in set(owner.values()) - stuck:
+            self._pending.pop(index, None)
+
+    def _verify_restored(self, targets: dict[int, Volume]) -> set[int]:
+        """The streams still not at their target after one retry."""
+        wrong = dict(targets)
+        for attempt in (1, 2):
             try:
                 live = {s.index: s for s in self._pactl.sink_inputs()}
             except PactlError as e:
-                log.warning("cannot list streams to restore, restoring blind: %s", e)
-                live = {i: Stream(i, entry.ducked, False, None, entry.app,
-                                  entry.restore_id)
-                        for i, entry in entries.items()}
-            moves: dict[int, tuple[Volume, Volume]] = {}
-            for index, entry in entries.items():
-                s = live.get(index)
-                if s is None or s.app != entry.app:
-                    self._remember_residue(entry)
-                    continue
-                if not _is_ours(s.volume, entry):
-                    log.info("stream %d volume changed during speech; leaving it", index)
-                    continue
-                moves[index] = (s.volume, entry.original)
-            self._fade(moves, self._fade_up)
-            self._verify_restored({i: end for i, (_, end) in moves.items()})
-        finally:
-            self._save_state()
-            if self._residue:
-                self._start_poller()
-
-    def _verify_restored(self, targets: dict[int, Volume]) -> None:
-        for attempt in (1, 2):
-            live = {s.index: s for s in self._pactl.sink_inputs()}
+                log.warning("cannot verify restore: %s", e)
+                return set(wrong)
             wrong = {i: v for i, v in targets.items()
                      if i in live and live[i].volume != v}
             if not wrong:
-                return
+                return set()
             if attempt == 2:
                 log.warning("restore did not take on streams %s (wanted %s)",
                             sorted(wrong), wrong)
-                return
+                return set(wrong)
             for index, volume in wrong.items():
                 self._pactl.set_volume(index, volume)
+        return set(wrong)
+
+    @staticmethod
+    def _matches(entry: Ducked, streams: list[Stream], claimed: set[int],
+                 entry_indexes: set[int]) -> list[Stream]:
+        key = _key(entry.restore_id, entry.app)
+        return [
+            s for s in streams
+            if s.index not in claimed and _is_ours(s.volume, entry)
+            and ((s.index == entry.index and s.app == entry.app)
+                 or (s.index not in entry_indexes and s.volume == entry.ducked
+                     and _key(s.restore_id, s.app) == key))
+        ]
+
+    def _lingering(self) -> bool:
+        return bool(self._residue or self._pending)
 
     def _fade(self, moves: dict[int, tuple[Volume, Volume]], seconds: float) -> None:
         if not moves:
@@ -441,7 +490,7 @@ class Ducker:
 
     def _poll(self) -> None:
         with self._lock:
-            while self._active or self._residue:
+            while self._active or self._lingering():
                 self._wake.wait(self._next_wake_delay())
                 self.tick()
             self._poller_running = False
@@ -456,13 +505,14 @@ class Ducker:
     # ── state file ────────────────────────────────────────────────────────
 
     def _save_state(self) -> None:
-        if not self._ducked and not self._residue:
+        entries = [*self._ducked.values(), *(e for e, _ in self._pending.values())]
+        if not entries and not self._residue:
             self._clear_state()
             return
         tmp = self._state_path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump({
-                "entries": [asdict(e) for e in self._ducked.values()],
+                "entries": [asdict(e) for e in entries],
                 "residue": [asdict(e) for e, _ in self._residue.values()],
             }, fh)
         os.replace(tmp, self._state_path)
@@ -485,15 +535,3 @@ class Ducker:
             os.unlink(self._state_path)
         except FileNotFoundError:
             pass
-
-    @staticmethod
-    def _recovery_match(entry: Ducked, streams: list[Stream],
-                        claimed: set[int]) -> Stream | None:
-        candidates = [
-            s for s in streams
-            if s.index not in claimed and _is_ours(s.volume, entry)
-            and ((s.index == entry.index and s.app == entry.app)
-                 or (entry.restore_id and s.restore_id == entry.restore_id))
-        ]
-        candidates.sort(key=lambda s: s.index != entry.index)
-        return candidates[0] if candidates else None

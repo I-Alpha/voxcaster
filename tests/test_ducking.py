@@ -586,3 +586,78 @@ def test_reconfigure_from_disabled_to_enabled_starts_ducking(tmp_path):
                   enabled=True)
     d.acquire(own_pid=778)
     assert pactl.volume(1) == (43872, 43872)
+
+
+def _chrome(index, volume=(FULL, FULL)):
+    return stream(index, volume, app="Google Chrome",
+                  restore_id="sink-input-by-application-name:Google Chrome")
+
+
+def test_restore_the_server_ignored_stays_pending_and_lands_on_a_later_tick(tmp_path):
+    pactl = FakePactl(_chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.ignore_sets[1] = 99
+    d.release()
+    assert pactl.volume(1) == (43872, 43872)
+    assert (tmp_path / "duck.json").exists()
+    pactl.ignore_sets[1] = 0
+    d.tick()
+    assert pactl.volume(1) == (FULL, FULL)
+    assert not (tmp_path / "duck.json").exists()
+
+
+def test_restore_cut_short_by_an_exception_is_finished_by_the_next_tick(tmp_path):
+    class Dies(FakePactl):
+        explode = False
+
+        def set_volume(self, index, volume):
+            if self.explode:
+                self.explode = False
+                raise RuntimeError("interrupted")
+            return super().set_volume(index, volume)
+
+    pactl = Dies(_chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.explode = True
+    d.release()
+    assert pactl.volume(1) == (43872, 43872)
+    d.tick()
+    assert pactl.volume(1) == (FULL, FULL)
+    assert not (tmp_path / "duck.json").exists()
+
+
+def test_stream_recreated_mid_duck_is_restored_by_identity_at_release(tmp_path):
+    pactl = FakePactl(_chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    pactl.streams[2] = _chrome(2, (43872, 43872))
+    d.release()
+    assert pactl.volume(2) == (FULL, FULL)
+
+
+def test_second_stream_of_a_ducked_app_born_unseen_is_restored_too(tmp_path):
+    pactl = FakePactl(_chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.streams[2] = _chrome(2, (43872, 43872))
+    d.release()
+    assert pactl.volume(1) == (FULL, FULL)
+    assert pactl.volume(2) == (FULL, FULL)
+    assert not (tmp_path / "duck.json").exists()
+
+
+def test_recovery_keeps_the_state_until_the_restore_takes(tmp_path):
+    pactl = FakePactl(_chrome(1))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    pactl.ignore_sets[1] = 99
+    successor = make_ducker(pactl, tmp_path)
+    successor.recover()
+    assert (tmp_path / "duck.json").exists()
+    pactl.ignore_sets[1] = 0
+    successor.tick()
+    assert pactl.volume(1) == (FULL, FULL)
+    assert not (tmp_path / "duck.json").exists()

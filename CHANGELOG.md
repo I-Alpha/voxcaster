@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Ducking no longer leaves another app ducked. A restore stays pending, with
+  its state file, until the server shows the stream back at its original; a
+  failed or interrupted restore is retried, and a stream of the same app that
+  was re-created or born mid-duck at the ducked level is restored too. Crash
+  recovery on start gets the same verification.
+
 ### Changed
 - At most `tts.max_resident_pipelines` (default 2) Kokoro pipelines stay in
   RAM; loading another evicts the least recently used. A pipeline unused for
