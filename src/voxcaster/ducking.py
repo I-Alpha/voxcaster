@@ -149,12 +149,27 @@ def _key(restore_id: str, app: str) -> str:
     return restore_id or f"app:{app}"
 
 
+def _fit(volume: Volume, channels: int) -> Volume:
+    """``volume`` for a stream with ``channels`` channels. The server stores one
+    level per restore key and hands it to a reborn stream whatever its channel
+    count (a mono stream's level comes back on a stereo one), so a uniform
+    volume carries over to any count."""
+    if len(volume) == channels or len(set(volume)) != 1:
+        return volume
+    return (volume[0],) * channels
+
+
+def _at(current: Volume, level: Volume) -> bool:
+    return current == _fit(level, len(current))
+
+
 def _is_ours(current: Volume, entry: Ducked) -> bool:
     """True while ``current`` still lies between the ducked and original levels,
     i.e. nobody but us has moved this stream's volume."""
-    return len(current) == len(entry.original) and all(
+    ducked, original = _fit(entry.ducked, len(current)), _fit(entry.original, len(current))
+    return len(current) == len(original) == len(ducked) and all(
         min(d, o) <= c <= max(d, o)
-        for c, d, o in zip(current, entry.ducked, entry.original)
+        for c, d, o in zip(current, ducked, original)
     )
 
 
@@ -326,14 +341,14 @@ class Ducker:
         original is then the one recorded for that sibling, not what it reads."""
         key = _key(s.restore_id, s.app)
         for sibling in self._ducked.values():
-            if _key(sibling.restore_id, sibling.app) == key and s.volume == sibling.ducked:
+            if _key(sibling.restore_id, sibling.app) == key and _at(s.volume, sibling.ducked):
                 return Ducked(s.index, s.app, s.restore_id,
-                              sibling.original, sibling.ducked)
+                              _fit(sibling.original, len(s.volume)), s.volume)
         dead = self._residue.get(key)
-        if dead is not None and s.volume == dead[0].ducked:
+        if dead is not None and _at(s.volume, dead[0].ducked):
             del self._residue[key]
             return Ducked(s.index, s.app, s.restore_id,
-                          dead[0].original, dead[0].ducked)
+                          _fit(dead[0].original, len(s.volume)), s.volume)
         target = tuple(round(v * self._volume_ratio) for v in s.volume)
         return Ducked(s.index, s.app, s.restore_id, s.volume, target)
 
@@ -351,8 +366,8 @@ class Ducker:
         if self._residue:
             for s in self._pactl.sink_inputs():
                 dead = self._residue.get(_key(s.restore_id, s.app))
-                if dead is not None and s.volume == dead[0].ducked:
-                    self._pactl.set_volume(s.index, dead[0].original)
+                if dead is not None and _at(s.volume, dead[0].ducked):
+                    self._pactl.set_volume(s.index, _fit(dead[0].original, len(s.volume)))
                     del self._residue[_key(s.restore_id, s.app)]
                     log.info("lifted stream %d (%s) born at a dead stream's ducked level",
                              s.index, s.app)
@@ -411,7 +426,7 @@ class Ducker:
                                      (entry, self._clock() + RESIDUE_TTL_SEC))
             for s in found:
                 claimed.add(s.index)
-                moves[s.index] = (s.volume, entry.original)
+                moves[s.index] = (s.volume, _fit(entry.original, len(s.volume)))
                 owner[s.index] = entry.index
         self._save_state()
         self._fade(moves, self._fade_up)
@@ -449,7 +464,7 @@ class Ducker:
             s for s in streams
             if s.index not in claimed and _is_ours(s.volume, entry)
             and ((s.index == entry.index and s.app == entry.app)
-                 or (s.index not in entry_indexes and s.volume == entry.ducked
+                 or (s.index not in entry_indexes and _at(s.volume, entry.ducked)
                      and _key(s.restore_id, s.app) == key))
         ]
 

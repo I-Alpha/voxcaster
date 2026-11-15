@@ -335,6 +335,33 @@ def test_repeated_stream_deaths_never_compound_the_duck(tmp_path):
         pactl.streams[index] = chrome(index)
 
 
+def test_stereo_stream_reborn_at_a_dead_mono_streams_level_never_compounds(tmp_path):
+    pactl = FakePactl(chrome(1, (FULL,)))
+    d = make_ducker(pactl, tmp_path)
+    index = 1
+    for cycle in range(3):
+        d.acquire(own_pid=777)
+        level = pactl.volume(index)[0]
+        assert level == 43872
+        del pactl.streams[index]
+        index += 1
+        pactl.streams[index] = chrome(index, (level,) * (2 if index % 2 else 1))
+        d.tick()
+        d.release()
+        assert set(pactl.volume(index)) == {FULL}
+
+
+def test_stereo_stream_born_at_a_dead_mono_streams_level_is_repaired_while_idle(tmp_path):
+    pactl = FakePactl(chrome(1, (FULL,)))
+    d = make_ducker(pactl, tmp_path)
+    d.acquire(own_pid=777)
+    del pactl.streams[1]
+    d.release()
+    pactl.streams[2] = chrome(2, (43872, 43872))
+    d.tick()
+    assert pactl.volume(2) == (FULL, FULL)
+
+
 def test_stream_born_ducked_after_the_line_is_repaired_while_idle(tmp_path):
     pactl = FakePactl(chrome(1))
     d = make_ducker(pactl, tmp_path)
