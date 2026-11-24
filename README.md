@@ -85,7 +85,9 @@ process, and overlapping lines talk over each other. `voxcaster` inverts this:
   in-flight playback mid-word, and speaks immediately.
 - **Background-audio ducking** — other apps' playback streams (music, video)
   dim while voxcaster speaks and return to exactly their prior volume after
-  (PulseAudio/PipeWire, via `pactl`; see `[ducking]` below).
+  (PulseAudio/PipeWire, via `pactl`; see `[ducking]` below). A restore stays
+  pending until the server shows the stream back at its original volume, and a
+  failed or interrupted restore is retried.
 - **Live volume control** — one socket message, applies from the next line;
   no restart.
 - **Render to file** — the same warm daemon writes a mono wav to any path

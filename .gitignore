@@ -23,3 +23,6 @@ venv/
 # Local config and logs (never commit machine-specific state)
 config.toml
 *.log
+
+# Debugging scratch
+scratch_*
