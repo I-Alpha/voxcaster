@@ -272,7 +272,7 @@ class TrayController:
         self._run(["xdg-open", self.config_path])
 
     def agent_voices(self) -> list[tuple[str, str]]:
-        """The per-agent voice map, read-only; it is policy-controlled."""
+        """The per-agent voice map, read-only."""
         try:
             with open(self._agents_path) as fh:
                 return sorted(json.load(fh).get("agents", {}).items())

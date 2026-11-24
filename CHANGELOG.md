@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (or the `\x05RENDER\x05` protocol message) synthesizes through the same
   warm daemon and writes a mono wav to the requested path instead of playing
   it. No per-call model load, no speaker required — the intended consumer is
-  voice-note / TTS integration (e.g. OpenClaw's `tts-local-cli` provider)
+  voice-note / TTS integration
   where the destination is a file, not a speaker. Honours the existing
   `\x03VOICE\x03` voice and `\x01INTERRUPT\x01` prefixes with the same
   nesting order as Speak, so one parser serves both message kinds. No espeak
@@ -159,8 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Restart=` supervision, which only tracks PID liveness — the heartbeat
   stops and systemd force-restarts the unit. Guards the `WATCHDOG_PID`
   mismatch case (pings from a PID systemd didn't arm are silently ignored
-  upstream). No-op outside systemd. Verified live: `SIGSTOP` on the daemon
-  → watchdog timeout at 30s → automatic restart → socket answering again.
+  upstream). No-op outside systemd.
 - `packaging/systemd/voxcaster.service.example` updated to match:
   `Type=notify`, `WatchdogSec=30`, `Restart=always`, and a note on serving
   the package-default socket plus a compat symlink for tooling that
@@ -171,9 +170,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leave the process alive indefinitely — non-daemon executor threads
   (torch/CUDA synthesis work) outlive the dead loop, so the interpreter
   never exits: the socket refuses connections while `ps`/systemd still see
-  a live process holding the singleton flock. Reproduced live (a spawned
-  daemon crashed mid-synthesis on a pip PEP 668 error and lingered exactly
-  like this). The daemon now logs the full traceback and hard-exits
+  a live process holding the singleton flock. The daemon now logs the full
+  traceback and hard-exits
   (`os._exit`), so the process dies for real and supervision restarts it.
 - **Silent worker death**: asyncio swallows task exceptions by default — a
   worker task killed by anything its per-line guard doesn't catch left the
@@ -194,26 +192,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Chronic post-spawn death**: the daemon had no handler for `SIGHUP` and
   its default disposition (immediate termination) killed it silently —
   no exception, no log line — any time its launching shell/session hung up
-  (e.g. a bare `daemon &` spawn from a script or ephemeral terminal). This
-  produced weeks of unexplained `FALLBACK reason=daemon down after spawn
-  attempt` entries in client logs with nothing in `daemon.log` to explain
-  them. `SIGHUP` is now ignored (with a log line), matching standard
-  daemon/nohup semantics — reproduced live via `kill -HUP <pid>` before and
-  after the fix.
+  (e.g. a bare `daemon &` spawn from a script or ephemeral terminal).
+  `SIGHUP` is now ignored (with a log line), matching standard daemon/nohup
+  semantics.
 - Any other uncaught exception during daemon startup/run is now logged
   with a full traceback before the process exits (previously relied on
   whatever redirected the process's stderr, which was not always captured).
-- Completed the `speakd` → `voxcaster` rename at the git level: the
-  actually-installed/running package (`src/voxcaster/`) had never been
-  committed, while the superseded `src/speakd/` copy was still tracked —
-  a fresh clone of this repo would not have produced a working daemon.
+- Completed the `speakd` → `voxcaster` rename: a fresh clone now contains
+  `src/voxcaster/` instead of the superseded `src/speakd/`.
 
 ### Added
 - `packaging/systemd/voxcaster.service.example`: an optional `systemd --user`
   unit with `Restart=on-failure` for supervised auto-restart — a second line
   of defense against any death the daemon itself cannot prevent (OOM, CUDA
-  driver faults, `kill -9`). Verified surviving 3 consecutive `SIGKILL`s in
-  a row, restarting within ~2s each time.
+  driver faults, `kill -9`).
 
 ## [0.2.0] - 2026-06-22
 
@@ -222,10 +214,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Markdown preprocessing: `strip_markdown()` removes code fences, URLs, headers, and formatting before synthesis. On by default (`markdown_preprocess = true`).
-- TTS_SUMMARY extraction: embed `<!-- TTS_SUMMARY concise version TTS_SUMMARY -->` in text and only the summary is spoken — ideal for Claude Code hook integration.
+- TTS_SUMMARY extraction: embed `<!-- TTS_SUMMARY concise version TTS_SUMMARY -->` in text and only the summary is spoken — ideal for LLM and CLI hook integration.
 - Per-request voice override: `speak("text", voice="bf_emma")` and `speak --voice bf_emma` override the daemon's configured voice for a single line.
 - `ping()` / `speak --ping`: health-check the daemon — returns `ready`, `starting`, or `down` without triggering synthesis.
-- `always_interrupt` config flag: every incoming request preempts in-flight playback (useful for Claude Code hooks where only the latest narration matters).
+- `always_interrupt` config flag: every incoming request preempts in-flight playback (useful for hooks where only the latest narration matters).
 
 ## [0.1.0] - 2026-06-11
 

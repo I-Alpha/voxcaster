@@ -267,4 +267,4 @@ the model can never be moved mid-utterance.
 
 ## License
 
-[MIT](LICENSE) © 2026 ibrahim Alfa
+[MIT](LICENSE) © 2026 I-Alpha

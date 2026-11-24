@@ -56,9 +56,7 @@ Newlines inside the payload
 The framing is one ``\\n``-terminated line per request, so a literal newline in
 the text WOULD end the request early: the daemon's ``readline()`` returns only
 the first line and the remainder is discarded when the connection closes — with
-an ACK still sent and exit status 0, i.e. silent loss. Measured 2026-07-30: a
-168-char three-paragraph payload arrived as 65 chars (61% destroyed), which is
-what "the listener only hears the first paragraph" actually was.
+an ACK still sent and exit status 0, i.e. silent loss.
 
 So ``encode_speak`` maps literal newlines to :data:`NEWLINE_ESCAPE` (RS, record
 separator) and the daemon maps them back before synthesis. RS is used for the

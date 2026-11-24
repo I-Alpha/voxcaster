@@ -296,51 +296,20 @@ class KokoroEngine:
 
     # ── synthesis ─────────────────────────────────────────────────────────
 
-    # PROSODY / DEFENCE-IN-DEPTH ONLY. This is NOT a truncation fix.
-    #
-    # It was introduced on the theory that KPipeline's split_pattern=r'\n+'
-    # (newlines only) made a long single-paragraph line arrive as ONE chunk and
-    # get truncated at the model's token limit. That theory is FALSIFIED.
-    #
-    # ⊨ MEASURED 2026-07-30, controlled two-arm, 2531-char newline-free input,
-    #   identical except for this function:
-    #     without chunking: 139.2s of audio @ 24000Hz (18.2 chars/sec)
-    #     with    chunking: 147.4s of audio @ 24000Hz (17.2 chars/sec)
-    #   ratio 1.06x. Both durations are full-length for the input, so nothing
-    #   was ever being lost here. Corroborated by daemon.log, which shows
-    #   pre-fix clips of 171.8s / 126.7s / 91.2s all completing with rc=0.
-    #
-    # ■ MECHANISM (kokoro/pipeline.py:195-220): split_pattern only builds the
-    #   OUTER graphemes. Each grapheme is then sub-batched internally by
-    #   KPipeline.en_tokenize at a 510-phoneme boundary, and every batch is
-    #   yielded as its own Result — which synthesize() below concatenates. The
-    #   only real truncation in Kokoro (pipeline.py:275-278, "Unexpected
-    #   len(ps) ... Truncating to 510") is reachable from
-    #   generate_from_tokens(), never from __call__().
-    #
-    # The actual silent loss was elsewhere and is fixed elsewhere: the wire
-    # protocol cut every payload at its first newline (see protocol.py's
-    # "Newlines inside the payload" — measured 61% loss on a 3-paragraph line),
-    # and tools/voice/speak_last_response.py truncated spans at 320 chars.
-    #
-    # Kept, not reverted, for two reasons that do not depend on the false
-    # theory: it makes chunk boundaries deterministic and sentence-aligned
-    # rather than phoneme-count-aligned (audibly better breaks), and it holds
-    # the line if a future kokoro drops the internal 510-phoneme batching.
-    # Its cost is the +6% duration above, from inter-chunk silence.
+    # Chunking keeps breaks on sentence boundaries. Kokoro batches long text
+    # itself (KPipeline.en_tokenize, 510 phonemes), so nothing is lost without
+    # it; the cost is about 6% extra duration from the silence between chunks.
     _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+(?=[A-Z0-9"\'(])')
     _CHUNK_BUDGET_CHARS = 320
 
     @classmethod
     def _chunk_for_pipeline(cls, text: str) -> str:
-        """Insert newlines so KPipeline chunks long text instead of truncating.
+        """Insert newlines so KPipeline breaks long text at sentence ends.
 
         Existing newlines are preserved as hard breaks (the caller may have
         meant them). Each resulting paragraph is packed into <=
         _CHUNK_BUDGET_CHARS pieces on sentence boundaries. A single sentence
-        longer than the budget is left intact rather than cut mid-clause — a
-        very long clause is a caller problem, and truncating it here would
-        reintroduce exactly the silent loss this exists to prevent.
+        longer than the budget is left intact rather than cut mid-clause.
         """
         out: list[str] = []
         for para in text.split('\n'):

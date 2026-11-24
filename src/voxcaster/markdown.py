@@ -1,6 +1,6 @@
 """Text preprocessing for speech: markdown stripping + TTS-summary extraction.
 
-Claude (and most LLM/CLI output) is heavy with markdown — code fences, URLs,
+LLM and CLI output is heavy with markdown — code fences, URLs,
 heading hashes, bold/italic stars, table pipes. Read aloud verbatim it sounds
 like line noise. Two transforms make raw LLM output safe to pipe straight into
 ``speak``:

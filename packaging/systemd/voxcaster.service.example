@@ -40,8 +40,7 @@ Environment=VOXCASTER_DEVICE=auto
 
 # Keep writing to voxcaster's own default log location (instead of only the
 # journal) so existing tooling/docs that tail ~/.local/state/voxcaster/daemon.log
-# keep working regardless of which mechanism (systemd, ensure_daemon(),
-# start_daemon.sh) launched the process.
+# keep working whether systemd or ensure_daemon() launched the process.
 StandardOutput=append:%h/.local/state/voxcaster/daemon.log
 StandardError=append:%h/.local/state/voxcaster/daemon.log
 

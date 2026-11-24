@@ -138,9 +138,7 @@ def ensure_daemon(config: Config | None = None) -> bool:
     FIRST: the respawned daemon stays tracked (journal, Restart= policy,
     watchdog) and runs under the unit's own interpreter/env — instead of
     leaking an untracked orphan bound to whatever python the client happens
-    to be running under (root cause of the orphan-daemon leak observed
-    2026-07-16: every fresh session raw-spawned a /usr/bin/python daemon
-    that later crashed into a half-dead zombie). Only if there is no unit —
+    to be running under. Only if there is no unit —
     or the unit came up but never produced THIS socket (e.g. it is
     configured for a different socket_path) — does the raw detached spawn
     (``python -m voxcaster.daemon``, overridable via ``$VOXCASTER_DAEMON_CMD``)
@@ -279,7 +277,7 @@ def render(text: str, output_path: str, voice: str | None = None,
 
     The file-output sibling of :func:`speak`: the same warm daemon that
     narrates to the speaker writes the audio to disk instead, so callers
-    (voice notes, OpenClaw TTS integration) get a playable file without
+    (voice notes, TTS integrations) get a playable file without
     paying a per-call model load. ``voice`` falls back to the daemon's
     configured voice when None. No espeak fallback exists for rendering —
     a file cannot be spoken.

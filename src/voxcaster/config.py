@@ -1,4 +1,4 @@
-"""Configuration for speakd.
+"""Configuration for voxcaster.
 
 Precedence (lowest to highest):
 

@@ -17,7 +17,7 @@ Design
 - If synthesis or playback fails, the line is spoken through a configurable
   fallback engine (espeak by default) — narration degrades, never disappears.
 
-Run it with ``speakd`` (installed console script) or ``python -m voxcaster.daemon``.
+Run it with ``voxcaster`` (installed console script) or ``python -m voxcaster.daemon``.
 """
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ class VoiceDaemon:
         path (same voice override, same interrupt-supersede check), but the
         waveform is written to disk with ``soundfile`` instead of being
         handed to a player. Used by the RENDER wire message so callers can
-        request an audio file (voice notes, OpenClaw TTS integration) from
+        request an audio file (voice notes, TTS integrations) from
         the same warm daemon -- no per-call model load.
 
         Unlike playback there is no audible fallback: if synthesis or the
@@ -742,12 +742,8 @@ def main(argv: list[str] | None = None) -> None:
     # must survive its launching shell/tty hanging up (e.g. an ad-hoc
     # `daemon &` spawn whose parent session tears down). SIGHUP's default
     # disposition is immediate termination with ZERO Python-visible trace —
-    # no exception, no log line. This was root-caused as the chronic
-    # "spawns then dies, falls back silently" bug: fallback.log showed 12+
-    # unexplained deaths over weeks with nothing in daemon.log to explain
-    # them; reproducing `kill -HUP <daemon pid>` against the unpatched
-    # daemon killed it instantly and silently, matching the pattern exactly.
-    # Installed here (before any slow imports/torch init) so the whole
+    # no exception, no log line. Installed here (before any slow
+    # imports/torch init) so the whole
     # process lifetime is covered, not just the post-bind asyncio loop.
     def _log_hangup(signum, _frame) -> None:
         log.info("ignoring signal %d (SIGHUP) — daemon is a persistent "
@@ -785,9 +781,8 @@ def main(argv: list[str] | None = None) -> None:
         # zombie: non-daemon executor threads (torch/CUDA synthesis work
         # scheduled via run_in_executor) outlive the dead event loop, so the
         # interpreter never exits — the socket refuses connections while
-        # `ps`/systemd still see a live process holding the flock (observed
-        # live 2026-07-16: a spawned daemon crashed mid-synthesis on a pip
-        # PEP 668 error and lingered exactly like this). os._exit() skips
+        # `ps`/systemd still see a live process holding the flock. os._exit()
+        # skips
         # the thread joins; the process dies for real and systemd's
         # Restart= policy brings a fresh one back.
         log.exception("daemon crashed — hard exit so no half-dead process lingers")

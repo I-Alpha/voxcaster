@@ -9,7 +9,7 @@ Run:  python examples/urgent_interrupt.py
 """
 import time
 
-from speakd import speak
+from voxcaster import speak
 
 
 def main() -> None:

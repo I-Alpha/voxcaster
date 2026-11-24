@@ -51,7 +51,7 @@ socket_mode = "600"
 
 # Treat every request as an interrupt: each new line drains the queue and cuts
 # off in-flight playback, so only the latest narration is ever spoken. Handy
-# for Claude Code hooks where stale lines aren't worth hearing. Default: false.
+# for hooks where stale lines aren't worth hearing. Default: false.
 always_interrupt = false
 
 # Longest single request line the daemon will accept, in bytes. This is a real

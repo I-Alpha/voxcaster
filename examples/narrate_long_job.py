@@ -10,7 +10,7 @@ Run:  python examples/narrate_long_job.py
 """
 import time
 
-from speakd import speak
+from voxcaster import speak
 
 STAGES = [
     ("loading dataset", 2),
