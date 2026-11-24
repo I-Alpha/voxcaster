@@ -31,6 +31,7 @@ import logging
 import os
 import signal
 import socket as socket_module
+import stat
 import subprocess
 import sys
 import threading
@@ -675,7 +676,12 @@ class VoiceDaemon:
     def _reset_stream_dir(self) -> None:
         """Create the daemon's private directory and empty it of anything a previous
         run left behind. Only called by the daemon that holds the singleton lock."""
-        os.makedirs(self.cfg.stream_dir, mode=0o700, exist_ok=True)
+        directory = self.cfg.stream_dir
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"{directory} is not a directory owned by this user")
+        os.chmod(directory, 0o700)
         for entry in os.scandir(self.cfg.stream_dir):
             if not entry.is_dir(follow_symlinks=False):
                 self._unlink(entry.path)

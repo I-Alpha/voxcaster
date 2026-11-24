@@ -12,6 +12,7 @@ from daemon_harness import (FAKE_PLAYER, make_cfg, request, request_no_reply,
 from fakes import SAMPLE_RATE, FakeKokoro
 
 from voxcaster import protocol, streaming
+from voxcaster.daemon import VoiceDaemon
 from voxcaster.streaming import Progress, ready_to_start
 
 
@@ -283,3 +284,14 @@ def test_a_slow_previous_line_holds_back_the_start_of_a_line_that_has_rendered_l
                      finished=False)
     assert ready_to_start(early, previous_ratio=None)
     assert not ready_to_start(early, previous_ratio=3.0)
+
+
+def test_a_daemon_directory_that_is_not_a_real_directory_of_ours_is_refused_and_left_alone(tmp_path):
+    cfg = make_cfg(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("not ours")
+    os.symlink(elsewhere, cfg.stream_dir)
+    with pytest.raises(RuntimeError):
+        asyncio.run(asyncio.wait_for(VoiceDaemon(cfg).run(), 3))
+    assert (elsewhere / "keep.txt").exists()

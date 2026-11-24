@@ -35,7 +35,7 @@ SENTENCE_PAUSE_SEC = 0.3
 SILENCE_AMPLITUDE = 0.002
 # Safety factor on the measured compute-per-audio ratio when deciding when to start.
 RATIO_MARGIN = 1.25
-# Below this much rendered audio the previous line's ratio is trusted over this line's.
+# Below this much rendered audio the previous line's ratio is a floor on this line's.
 MIN_RATIO_AUDIO_SEC = 3.0
 POLL_SEC = 0.05
 
@@ -186,9 +186,6 @@ class LineSynth:
         with self._cv:
             self._cancelled = True
             self._cv.notify_all()
-
-    def join(self, timeout: float | None = None) -> None:
-        self._thread.join(timeout)
 
     def take(self, timeout: float) -> tuple[bytes, bool]:
         """Next buffered PCM and whether the line has ended; waits up to ``timeout`` for audio."""
