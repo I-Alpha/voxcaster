@@ -64,7 +64,7 @@ process, and overlapping lines talk over each other. `voxcaster` inverts this:
 │  CI job, cron, hook  │──┘         │   FIFO queue ──▶ worker (thread executor)     │
 └──────────────────────┘            │                     │                         │
           ▲                         │                     ▼                         │
-          │ "OK\n" ack              │   Kokoro TTS ──▶ wav ──▶ mpv ──▶ 🔊           │
+          │ "OK\n" ack              │   Kokoro TTS ──▶ pipe ──▶ mpv ──▶ 🔊          │
           │ (blocking mode only)    │   CPU ⇄ GPU                                   │
           └─────────────────────────│   (offloads after idle keepalive)             │
                                     │                                               │
@@ -81,6 +81,14 @@ process, and overlapping lines talk over each other. `voxcaster` inverts this:
   the GPU for narration bursts, and releases its VRAM (~3 GB) after a
   configurable idle period. If the GPU is full (another job grabbed it), that
   request simply synthesizes on CPU instead of failing.
+- **Gapless streaming**: a line of any length is one call. Kokoro renders it
+  piece by piece and the audio is streamed to the player while the rest is
+  still being made, so speech starts after the first piece when synthesis is
+  fast and after enough buffering when it is not, and never cuts off or skips.
+  While a line plays the next queued line is rendered ahead, so lines follow
+  each other without waiting for synthesis. The silence Kokoro adds between
+  the pieces of one paragraph is trimmed to one natural pause; a line break in
+  the text stays a paragraph break.
 - **Interrupt protocol** — an urgent line drains the pending queue, kills
   in-flight playback mid-word, and speaks immediately.
 - **Background-audio ducking** — other apps' playback streams (music, video)
@@ -177,8 +185,8 @@ file; CLI flags override both.
 | `daemon.socket_mode` | — | `"600"` | Octal permissions on the socket file |
 | `daemon.log_file` | `VOXCASTER_LOG_FILE` | `~/.local/state/voxcaster/daemon.log` | Log target for auto-spawned daemons |
 | `audio.volume` | `VOXCASTER_VOLUME` | `100` | Playback volume `0–130` (mpv scale) |
-| `audio.max_playback_seconds` | — | `120` | Kill a single line's playback after this |
-| `audio.player` | - | mpv template | Player argv; `{file}`, `{volume}` and `{ipc}` (mpv IPC socket, needed for live volume and pause) are substituted |
+| `audio.max_playback_seconds` | - | `120` | Hang-protection floor: playback is killed when it runs this long, or the length of the line rendered so far plus 30 s if that is longer. Time paused, and time spent waiting for synthesis, does not count |
+| `audio.player` | - | mpv template | Player argv; `{file}`, `{volume}` and `{ipc}` (mpv IPC socket, needed for live volume and pause) are substituted. `{file}` is a named pipe carrying a WAV stream of unknown length, so the player must be able to read a WAV from a pipe (mpv can) |
 | `ducking.enabled` | — | `true` | Dim other playback streams while speaking |
 | `ducking.factor` | — | `0.3` | Amplitude multiplier for other streams, `0–1` (`0.5` is about -6 dB, `0.3` about -10.5 dB, `0.25` about -12 dB) |
 | `ducking.fade_down_ms` | — | `150` | Fade-out time when speech starts |
@@ -258,7 +266,7 @@ the model can never be moved mid-utterance.
 | Symptom | Likely cause / fix |
 |---|---|
 | `speak` says *fallback engine used* | Daemon failed to start — check `~/.local/state/voxcaster/daemon.log`. Most common: `kokoro` not installed in the Python that spawned it (set `VOXCASTER_DAEMON_CMD="/path/to/python -m voxcaster.daemon"`). |
-| No audio, no errors | Is `mpv` installed and does it play a wav from your terminal? Swap `audio.player` if you use a different player. |
+| No audio, no errors | Is `mpv` installed and does it play a wav from your terminal? Swap `audio.player` if you use a different player; it must read a WAV from a named pipe. |
 | First line is slow | Cold start: model weights load on first request (a few seconds). Subsequent lines are fast. |
 | Robotic voice instead of Kokoro | That *is* the espeak fallback working as designed — see the first row. |
 | Two daemons after a crash | They cannot coexist: the flock singleton makes the second exit immediately, and stale sockets are cleaned on startup. Delete `<socket>.lock` only if a machine crash left it owned by a dead PID holder (flock releases on process death, so this is near-impossible). |

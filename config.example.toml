@@ -69,13 +69,16 @@ max_message_bytes = 16777216
 # Playback volume 0-130 (mpv scale; 100 = nominal, >100 = software gain).
 volume = 100
 
-# Hang-protection FLOOR, not a cap on legitimate long content: a clip whose
-# real duration exceeds this gets its own duration + margin as the actual
-# timeout, so a long ("book"-length) message is never cut off mid-playback —
-# this value only guarantees a minimum kill-timeout for short/silent hangs.
+# Hang-protection FLOOR, not a cap on legitimate long content: the player is
+# killed after running this long, or after the length of the line rendered so
+# far plus a margin if that is longer, so a long ("book"-length) message is
+# never cut off mid-playback. Time paused, and time spent waiting for synthesis
+# to catch up, does not count.
 max_playback_seconds = 120
 
-# Audio player argv template. "{file}" is the wav path, "{volume}" the
+# Audio player argv template. "{file}" is a named pipe that carries a WAV
+# stream of unknown length (the line is played while it is still being
+# rendered), so the player must read a WAV from a pipe; mpv does. "{volume}" is the
 # current volume, "{ipc}" a socket path for mpv's JSON IPC. With "{ipc}" a
 # volume, mute or pause change reaches the line already playing; a player
 # without it only picks up a new volume on the next line and cannot be paused

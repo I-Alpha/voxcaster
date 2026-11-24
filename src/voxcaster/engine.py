@@ -22,8 +22,10 @@ RAM) is kept per voice language. At most ``max_resident_pipelines`` stay
 loaded, least recently used evicted first, and a pipeline unused for
 ``idle_unload_seconds`` is unloaded; both return the freed heap to the OS.
 
-All device moves, evictions and synthesis calls are serialised by an internal lock,
-so the idle-offload timer can never move the model mid-synthesis.
+All device moves, evictions and synthesis are serialised by an internal lock. A
+synthesis stream holds it from its first piece until the stream ends or is
+closed, so the idle-offload timer can never move a model, and a second request
+can never use a pipeline, while a line is still being rendered.
 """
 from __future__ import annotations
 
@@ -35,7 +37,8 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -49,7 +52,33 @@ class SynthesisError(RuntimeError):
     """TTS synthesis failed (model unavailable, OOM, bad input, ...).
 
     Callers should treat this as 'use the fallback engine', not as fatal.
+    ``chunk_index`` is the chunk of the plan being rendered when it failed.
     """
+
+    def __init__(self, message: str, chunk_index: int = 0) -> None:
+        super().__init__(message)
+        self.chunk_index = chunk_index
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """One run of text handed to the pipeline. ``paragraph_start`` marks the first
+    chunk of every paragraph after the first."""
+    text: str
+    paragraph_start: bool
+
+
+@dataclass(frozen=True)
+class Piece:
+    """What the pipeline yielded for one result. ``paragraph_break`` is True when
+    the silence before it is an authored paragraph break rather than a join
+    between chunks of one paragraph."""
+    samples: np.ndarray
+    sample_rate: int
+    chunk_index: int
+    paragraph_break: bool
+    chars: int
+    compute_seconds: float
 
 
 KOKORO_LANG_CODES = "abefhijpz"
@@ -297,49 +326,67 @@ class KokoroEngine:
     # ── synthesis ─────────────────────────────────────────────────────────
 
     # Chunking keeps breaks on sentence boundaries. Kokoro batches long text
-    # itself (KPipeline.en_tokenize, 510 phonemes), so nothing is lost without
-    # it; the cost is about 6% extra duration from the silence between chunks.
+    # itself (KPipeline.en_tokenize, 510 phonemes), so nothing is lost without it.
     _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+(?=[A-Z0-9"\'(])')
     _CHUNK_BUDGET_CHARS = 320
 
     @classmethod
-    def _chunk_for_pipeline(cls, text: str) -> str:
-        """Insert newlines so KPipeline breaks long text at sentence ends.
+    def plan_chunks(cls, text: str) -> list[Chunk]:
+        """Split ``text`` into the chunks the pipeline renders one at a time.
 
-        Existing newlines are preserved as hard breaks (the caller may have
-        meant them). Each resulting paragraph is packed into <=
-        _CHUNK_BUDGET_CHARS pieces on sentence boundaries. A single sentence
-        longer than the budget is left intact rather than cut mid-clause.
+        Each newline-separated paragraph is packed into <= _CHUNK_BUDGET_CHARS
+        chunks on sentence boundaries. A single sentence longer than the budget
+        is left intact rather than cut mid-clause.
         """
-        out: list[str] = []
+        chunks: list[Chunk] = []
         for para in text.split('\n'):
             para = para.strip()
             if not para:
                 continue
+            pieces: list[str] = []
             if len(para) <= cls._CHUNK_BUDGET_CHARS:
-                out.append(para)
-                continue
-            cur = ''
-            for sent in cls._SENTENCE_SPLIT.split(para):
-                if not sent:
-                    continue
-                if cur and len(cur) + 1 + len(sent) > cls._CHUNK_BUDGET_CHARS:
-                    out.append(cur)
-                    cur = sent
-                else:
-                    cur = f'{cur} {sent}' if cur else sent
-            if cur:
-                out.append(cur)
-        return '\n'.join(out)
+                pieces.append(para)
+            else:
+                cur = ''
+                for sent in cls._SENTENCE_SPLIT.split(para):
+                    if not sent:
+                        continue
+                    if cur and len(cur) + 1 + len(sent) > cls._CHUNK_BUDGET_CHARS:
+                        pieces.append(cur)
+                        cur = sent
+                    else:
+                        cur = f'{cur} {sent}' if cur else sent
+                if cur:
+                    pieces.append(cur)
+            for n, piece in enumerate(pieces):
+                chunks.append(Chunk(piece, paragraph_start=n == 0 and bool(chunks)))
+        return chunks
 
-    def synthesize(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int]:
-        """Synthesize ``text`` to a mono float waveform.
+    @staticmethod
+    def _result_samples(result) -> np.ndarray | None:
+        # Explicit None-checks: truth-testing a tensor raises
+        # "Boolean value of Tensor is ambiguous".
+        audio = None
+        if getattr(result, "audio", None) is not None:
+            audio = result.audio
+        elif getattr(result, "wav", None) is not None:
+            audio = result.wav
+        if audio is None:
+            return None
+        arr = audio.squeeze()
+        return arr.cpu().numpy() if hasattr(arr, "cpu") else np.asarray(arr)
+
+    def stream(self, chunks: list[Chunk], voice: str | None = None) -> Iterator[Piece]:
+        """Render ``chunks`` and yield each piece as the pipeline produces it.
 
         ``voice`` overrides the engine's default voice for this request only
         (falls back to ``self.voice`` when None).
 
-        Returns ``(samples, sample_rate)``. Raises :class:`SynthesisError`
-        on any failure. Blocking — call from a thread executor.
+        The synthesis lock is taken when the first piece is requested and held
+        until the generator finishes or is closed, so close it promptly when
+        abandoning a stream; it is released after at most the piece being
+        rendered. Raises :class:`SynthesisError` on any failure, including a plan
+        that yields no audio. Blocking: iterate from a worker thread.
         """
         voice = voice or self.voice
         # CROSS-CALLER CONTENTION GUARD. One daemon serves every caller on the
@@ -364,32 +411,50 @@ class KokoroEngine:
             if (self.dynamic_offload or self.always_gpu) and lang not in self._gpu_langs:
                 self._to_gpu_locked(lang)  # failure is logged; CPU synthesis continues
 
+            index = 0
+            produced = 0
             try:
-                chunks: list[np.ndarray] = []
-                sample_rate = DEFAULT_SAMPLE_RATE
-                chunked = self._chunk_for_pipeline(text)
-                for result in pipeline(chunked, voice=voice, speed=self.speed):
-                    # Explicit None-checks: truth-testing a tensor raises
-                    # "Boolean value of Tensor is ambiguous".
-                    audio = None
-                    if getattr(result, "audio", None) is not None:
-                        audio = result.audio
-                    elif getattr(result, "wav", None) is not None:
-                        audio = result.wav
-                    if audio is not None:
-                        arr = audio.squeeze()
-                        chunks.append(arr.cpu().numpy() if hasattr(arr, "cpu") else np.asarray(arr))
-                    if getattr(result, "sample_rate", None):
-                        sample_rate = result.sample_rate
-                if not chunks:
-                    raise RuntimeError("no audio chunks produced")
-                wav = np.concatenate(chunks)
+                for index, chunk in enumerate(chunks):
+                    results = iter(pipeline(chunk.text, voice=voice, speed=self.speed))
+                    first_in_chunk = True
+                    while True:
+                        began = time.perf_counter()
+                        result = next(results, None)
+                        compute = time.perf_counter() - began
+                        if result is None:
+                            break
+                        samples = self._result_samples(result)
+                        if samples is None:
+                            continue
+                        graphemes = getattr(result, "graphemes", None)
+                        yield Piece(
+                            samples=samples,
+                            sample_rate=getattr(result, "sample_rate", None) or DEFAULT_SAMPLE_RATE,
+                            chunk_index=index,
+                            paragraph_break=first_in_chunk and chunk.paragraph_start,
+                            chars=len(graphemes) if graphemes else (len(chunk.text) if first_in_chunk else 0),
+                            compute_seconds=compute,
+                        )
+                        produced += 1
+                        first_in_chunk = False
+                if not produced:
+                    raise SynthesisError("no audio chunks produced")
+            except SynthesisError:
+                raise
             except Exception as e:
-                raise SynthesisError(str(e)) from e
+                raise SynthesisError(str(e), chunk_index=index) from e
             finally:
                 # Stamp even on failure so the offload timer measures real
                 # activity, not just successes.
                 self._last_used = self._clock()
                 if lang in self._pipeline_last_used:
                     self._pipeline_last_used[lang] = self._last_used
-        return wav, sample_rate
+
+    def synthesize(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int]:
+        """Synthesize ``text`` to a mono float waveform.
+
+        Returns ``(samples, sample_rate)``. Raises :class:`SynthesisError`
+        on any failure. Blocking: call from a thread executor.
+        """
+        pieces = list(self.stream(self.plan_chunks(text), voice))
+        return np.concatenate([p.samples for p in pieces]), pieces[-1].sample_rate

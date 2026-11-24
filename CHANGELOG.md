@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Gapless streaming. A speak line of any length is rendered piece by piece and
+  streamed to one player process through a named pipe, so playback starts
+  before the whole line is rendered. Playback begins after the first piece
+  when synthesis is fast, and after enough buffering when it is slower than
+  real time; a stream that still runs dry waits at a piece boundary and
+  carries on without losing audio.
+- While a line plays, the next queued speak line is rendered ahead (one line,
+  bounded buffer), so lines follow each other without a synthesis gap. Drop,
+  clear, stop and interrupt discard it.
+- The silence between the pieces of one paragraph is trimmed to one sentence
+  pause; line breaks in the text remain paragraph breaks. Render-to-file
+  output is unchanged.
+- The daemon keeps its player pipes and control socket in a private directory
+  next to its socket (`<socket>.d`), removes them on every path, and empties
+  the directory on start.
+
+### Changed
+- `audio.player`: `{file}` is now a named pipe carrying a WAV stream of unknown
+  length instead of a finished wav file. The player must be able to read that.
+- `audio.max_playback_seconds` is a floor on the hang timeout; the timeout also
+  follows the length of the line rendered so far, and time spent waiting for
+  synthesis does not count.
+- If synthesis fails part-way through a line, the audio already rendered is
+  played and only the remainder is spoken through the fallback.
+
 ### Fixed
 - Ducking no longer leaves another app ducked. A restore stays pending, with
   its state file, until the server shows the stream back at its original; a

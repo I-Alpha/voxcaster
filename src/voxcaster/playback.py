@@ -121,10 +121,14 @@ class Playback:
                 self._duck.release()
                 self._ducking = False
 
-    def wait(self, budget_sec: float) -> None:
+    def wait(self, budget: Callable[[], float],
+             starved: Callable[[], bool] = lambda: False) -> None:
         """Wait for the player to end, re-sending the mix while the last send
-        failed. Time the player is paused does not count against ``budget_sec``;
-        a player still running when the budget is spent is killed."""
+        failed. Time the player is paused, or starved of audio by a renderer
+        that has not caught up, does not count against ``budget()``, which is
+        read afresh each time because the length of a stream grows while it
+        plays. A player still running when the budget is spent is killed."""
+        used = 0.0
         while True:
             try:
                 self._proc.wait(timeout=WAIT_SLICE_SEC)
@@ -132,9 +136,9 @@ class Playback:
             except subprocess.TimeoutExpired:
                 if self._control is not None and not self._in_sync:
                     self.apply()
-                if self._control is None or not self._mix().paused:
-                    budget_sec -= WAIT_SLICE_SEC
-                if budget_sec <= 0:
+                if (self._control is None or not self._mix().paused) and not starved():
+                    used += WAIT_SLICE_SEC
+                if used >= budget():
                     self._proc.kill()
                     self._proc.wait()
                     return

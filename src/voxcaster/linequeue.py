@@ -36,6 +36,9 @@ class LineQueue:
             await self._arrived.wait()
         return self._lines.popleft()
 
+    def head(self) -> Line | None:
+        return self._lines[0] if self._lines else None
+
     def snapshot(self) -> list[Line]:
         return list(self._lines)
 

@@ -133,6 +133,12 @@ class Config:
         return self.socket_path + ".lock"
 
     @property
+    def stream_dir(self) -> str:
+        """Private directory for the daemon's own files (player FIFOs, the player's
+        control socket), derived from the socket path like ``lock_path``."""
+        return self.socket_path + ".d"
+
+    @property
     def fallback_log(self) -> str:
         """Client-side log of fallback events, next to the daemon log."""
         return os.path.join(os.path.dirname(self.log_file), "fallback.log")

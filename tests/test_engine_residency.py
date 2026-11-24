@@ -3,6 +3,8 @@ import threading
 import numpy as np
 import pytest
 
+from fakes import FakeKokoro
+
 from voxcaster import engine as engine_module
 from voxcaster.engine import KokoroEngine
 
@@ -114,3 +116,25 @@ def test_evicting_a_pipeline_returns_its_memory_to_the_os(engine, monkeypatch):
     for voice in (AMERICAN, BRITISH, SPANISH):
         engine.synthesize("hi", voice=voice)
     assert released
+
+
+def test_synthesize_returns_every_piece_untrimmed_and_in_order(clock):
+    kokoro = FakeKokoro(audio_sec=0.1, lead_sec=0.2, tail_sec=0.2)
+    engine = KokoroEngine(voice=AMERICAN, policy="cpu", pipeline_factory=kokoro, clock=clock)
+    wav, rate = engine.synthesize("one\ntwo\nthree")
+    assert rate == 24000
+    assert np.array_equal(np.rint(wav * 32767).astype(np.int16), kokoro.received())
+
+
+def test_an_open_stream_keeps_its_pipeline_in_place_until_it_is_closed(engine, clock):
+    engine.synthesize("hi")
+    clock.now += 10 * IDLE_UNLOAD
+    stream = engine.stream(engine.plan_chunks("one\ntwo"))
+    next(stream)
+    sweeper = threading.Thread(target=engine.unload_idle)
+    sweeper.start()
+    sweeper.join(timeout=0.3)
+    assert sweeper.is_alive()
+    stream.close()
+    sweeper.join(timeout=3)
+    assert not sweeper.is_alive()

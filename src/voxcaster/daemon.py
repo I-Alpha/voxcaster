@@ -4,9 +4,10 @@ Design
 ------
 - One asyncio Unix-socket server accepts newline-terminated requests
   (see :mod:`voxcaster.protocol`) and feeds a FIFO queue.
-- A single worker drains the queue, synthesizing each line with Kokoro in a
-  thread executor (the event loop never blocks on the model) and playing it
-  through an external audio player.
+- A single worker drains the queue. Each line is rendered with Kokoro on its own
+  thread (the event loop never blocks on the model) and streamed to one external
+  audio player process through a named pipe, so playback begins before the line is
+  fully rendered. While a line plays, the next queued line is rendered ahead.
 - An interrupt request drains everything queued, kills in-flight playback,
   and jumps its own text to the front.
 - An idle timer offloads the model from GPU to CPU after a configurable
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import itertools
 import json
 import logging
 import os
@@ -31,7 +33,6 @@ import signal
 import socket as socket_module
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import Awaitable, Callable
@@ -42,6 +43,7 @@ from .ducking import Ducker, PactlCli
 from .engine import KokoroEngine, SynthesisError
 from .linequeue import Line, LineQueue
 from .playback import Mix, MpvControl, Playback
+from .streaming import FifoFeeder, LineSynth, ready_to_start
 
 log = logging.getLogger("voxcaster.daemon")
 
@@ -49,6 +51,7 @@ log = logging.getLogger("voxcaster.daemon")
 READLINE_TIMEOUT_SEC = 5.0
 PLAYBACK_HEADROOM_SEC = 30.0
 PAUSE_POLL_SEC = 0.1
+FEEDER_JOIN_SEC = 2.0
 
 
 def _sd_notify(msg: str) -> None:
@@ -102,7 +105,12 @@ class VoiceDaemon:
         self._queue: LineQueue | None = None
         self._stop: asyncio.Event | None = None
 
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._current_player: Playback | None = None
+        self._current_synth: LineSynth | None = None
+        self._prepared: dict[int, LineSynth] = {}
+        self._last_ratio: float | None = None
+        self._fifo_ids = itertools.count(1)
         self._player_lock = threading.Lock()
         self._current_line: Line | None = None
         self._current_started = 0.0
@@ -127,33 +135,93 @@ class VoiceDaemon:
         # (int reads/writes are atomic under the GIL — no extra lock needed.)
         self._interrupt_epoch = 0
         self._busy = False
-        self._ipc_path = os.path.join(os.path.dirname(cfg.socket_path),
-                                      f"voxcaster-player-{os.getpid()}.sock")
+        self._ipc_path = os.path.join(cfg.stream_dir, "player.sock")
         self._player_has_ipc = any("{ipc}" in a for a in cfg.player)
 
     # ── synthesis + playback (blocking; runs in a thread executor) ────────
 
-    def _speak_sync(self, text: str, voice: str | None = None) -> None:
+    def _speak_sync(self, line: Line) -> None:
+        prepared = self._prepared.pop(line.id, None)
         if self.volume <= 0:
-            log.info("muted (volume 0), not speaking: %s", text[:60])
+            log.info("muted (volume 0), not speaking: %s", line.text[:60])
+            if prepared is not None:
+                prepared.cancel()
             return
         epoch = self._interrupt_epoch
-        audio = None
+        synth = prepared or self._new_synth(line)
+        with self._player_lock:
+            superseded = self._interrupt_epoch != epoch
+            if not superseded:
+                self._current_synth = synth
+        self._schedule_prepare()
         try:
-            audio = self.engine.synthesize(text, voice=voice)
-        except SynthesisError as e:
-            log.warning("synthesis failed — using fallback: %s", e)
+            if superseded:
+                log.info("dropped superseded line (ended before playback): %s", line.text[:60])
+            else:
+                self._stream_line(line.text, synth, epoch)
+        finally:
+            synth.cancel()
+            with self._player_lock:
+                self._current_synth = None
+
+    def _new_synth(self, line: Line) -> LineSynth:
+        return LineSynth(self.engine, line.text, line.voice, self._synth_done)
+
+    def _synth_done(self, synth: LineSynth) -> None:
+        """Runs on the renderer thread once it has released the engine."""
+        if synth.error is None and not synth.cancelled:
+            self._last_ratio = synth.progress().ratio
+        self._schedule_prepare()
+
+    def _schedule_prepare(self) -> None:
+        if self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._prepare_next)
+            except RuntimeError:
+                pass
+
+    def _prepare_next(self) -> None:
+        """Start rendering the queued line at the head while the current one plays.
+
+        Runs on the event loop. Only one line is ever prepared, and only once the
+        current line has finished rendering, so two renderers never contend."""
+        current = self._current_synth
+        if self._prepared or self.volume <= 0 or current is None or not current.progress().finished:
+            return
+        head = self._queue.head()
+        if head is not None and head.render_path is None:
+            self._prepared[head.id] = self._new_synth(head)
+
+    def _discard_prepared(self, line_id: int | None = None) -> None:
+        for key in [line_id] if line_id is not None else list(self._prepared):
+            synth = self._prepared.pop(key, None)
+            if synth is not None:
+                synth.cancel()
+
+    def _stream_line(self, text: str, synth: LineSynth, epoch: int) -> None:
+        if not self._await_start(synth, epoch):
+            log.info("dropped superseded line (ended before playback): %s", text[:60])
+            return
+        if synth.progress().pieces == 0:
+            log.warning("synthesis failed, using fallback: %s", synth.error)
+            self._speak_fallback(text)
+            return
         if not self._survives_pause(epoch) or self._interrupt_epoch != epoch:
             log.info("dropped superseded line (ended before playback): %s", text[:60])
             return
         if self.volume <= 0:
             log.info("muted (volume 0) before playback, dropping: %s", text[:60])
             return
-        if audio is None:
-            self._speak_fallback(text)
-        else:
-            wav, sample_rate = audio
-            self._play(wav, sample_rate, text, epoch)
+        self._play_stream(text, synth, epoch)
+
+    def _await_start(self, synth: LineSynth, epoch: int) -> bool:
+        """Block until enough of the line is rendered to start playing it."""
+        while self._interrupt_epoch == epoch:
+            progress = synth.progress()
+            if progress.finished or ready_to_start(progress, self._last_ratio):
+                return True
+            synth.wait_progress(PAUSE_POLL_SEC)
+        return False
 
     def _survives_pause(self, epoch: int) -> bool:
         """Block while paused; False if the line was ended in the meantime."""
@@ -200,39 +268,52 @@ class VoiceDaemon:
         log.info("rendered (%dHz, %.1fs): %s -> %s",
                  sample_rate, len(wav) / sample_rate, text[:60], render_path)
 
-    def _play(self, wav, sample_rate: int, text: str, epoch: int) -> None:
-        import soundfile as sf
+    def _play_stream(self, text: str, synth: LineSynth, epoch: int) -> None:
+        fifo_path = os.path.join(self.cfg.stream_dir, f"line-{next(self._fifo_ids)}.wav")
+        feeder = None
+        playback = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                sf.write(f.name, wav, sample_rate)
-                tmp_path = f.name
-            playback = self._spawn_player(self._render_player_argv(tmp_path), epoch)
+            os.mkfifo(fifo_path, 0o600)
+            playback = self._spawn_player(self._render_player_argv(fifo_path), epoch)
             if playback is None:
                 log.info("dropped superseded line (ended before playback): %s", text[:60])
-                self._unlink(tmp_path)
                 return
-            duration_seconds = len(wav) / sample_rate if sample_rate else 0.0
-            hang_limit = max(self.cfg.max_playback_seconds,
-                             duration_seconds + PLAYBACK_HEADROOM_SEC)
+            feeder = FifoFeeder(fifo_path, synth, lambda: playback.alive)
+            feeder.start()
+            def hang_limit() -> float:
+                return max(self.cfg.max_playback_seconds,
+                           synth.progress().audio_sec + PLAYBACK_HEADROOM_SEC)
+
             try:
                 playback.start()
-                playback.wait(hang_limit)
+                playback.wait(hang_limit, lambda: feeder.starved)
             finally:
                 playback.finish()
                 with self._player_lock:
                     if self._current_player is playback:
                         self._current_player = None
-                self._unlink(self._ipc_path)
-            self._unlink(tmp_path)
-            if playback.returncode == 0:
-                log.info("spoke (%dHz, %.1fs): %s",
-                         sample_rate, len(wav) / sample_rate, text[:60])
-            else:
-                log.info("playback cut short (player rc=%s): %s",
-                         playback.returncode, text[:60])
+            self._log_outcome(text, synth, playback, epoch)
         except Exception as e:
             log.warning("audio playback failed — using fallback: %s", e)
             self._speak_fallback(text)
+        finally:
+            synth.cancel()
+            if feeder is not None:
+                feeder.stop()
+                feeder.join(FEEDER_JOIN_SEC)
+            self._unlink(fifo_path)
+            self._unlink(self._ipc_path)
+
+    def _log_outcome(self, text: str, synth: LineSynth, playback: Playback, epoch: int) -> None:
+        if playback.returncode != 0:
+            log.info("playback cut short (player rc=%s): %s", playback.returncode, text[:60])
+            return
+        progress = synth.progress()
+        if synth.error is not None and self._interrupt_epoch == epoch:
+            log.warning("synthesis failed part-way, speaking the rest through the fallback: %s",
+                        synth.error)
+            self._speak_fallback(synth.unspoken_text())
+        log.info("spoke (%.1fs): %s", progress.audio_sec, text[:60])
 
     def _spawn_player(self, argv: list[str], epoch: int) -> Playback | None:
         """Start the player and register it as current; None if an interrupt
@@ -308,7 +389,7 @@ class VoiceDaemon:
                         None, self._render_sync, line.text, line.voice, line.render_path
                     )
                 else:
-                    await loop.run_in_executor(None, self._speak_sync, line.text, line.voice)
+                    await loop.run_in_executor(None, self._speak_sync, line)
             except Exception:
                 # _speak_sync/_render_sync handle their own fallbacks; this
                 # guards the worker task against anything unexpected so the
@@ -331,16 +412,22 @@ class VoiceDaemon:
         log.info("[interrupt] drained %d queued, stopped current=%s: %s",
                  drained, killed, text[:60])
         self._queue.put(text, voice, render_path, writer)
+        self._prepare_next()
 
     def _end_current_line(self) -> bool:
         """End the line being synthesized or played; returns whether a player was killed."""
         self._interrupt_epoch += 1
+        with self._player_lock:
+            synth = self._current_synth
+        if synth is not None:
+            synth.cancel()
         return self._kill_current_player()
 
     def _drop_queued(self) -> int:
         lines = self._queue.drain()
         for line in lines:
             self._close(line)
+        self._discard_prepared()
         return len(lines)
 
     @staticmethod
@@ -451,6 +538,7 @@ class VoiceDaemon:
         if line is None:
             return f"ERR no queued line {line_id}\n".encode()
         self._close(line)
+        self._discard_prepared(line_id)
         log.info("[drop] line %d: %s", line_id, line.text[:60])
         return protocol.ACK
 
@@ -578,10 +666,19 @@ class VoiceDaemon:
                                       render_path=render_path)
             else:
                 self._queue.put(text, voice, render_path, writer)
+                self._prepare_next()
         except Exception:
             writer.close()
 
     # ── socket lifecycle ───────────────────────────────────────────────────
+
+    def _reset_stream_dir(self) -> None:
+        """Create the daemon's private directory and empty it of anything a previous
+        run left behind. Only called by the daemon that holds the singleton lock."""
+        os.makedirs(self.cfg.stream_dir, mode=0o700, exist_ok=True)
+        for entry in os.scandir(self.cfg.stream_dir):
+            if not entry.is_dir(follow_symlinks=False):
+                self._unlink(entry.path)
 
     def _remove_stale_socket(self) -> None:
         """Unlink the socket file if nothing is listening on it."""
@@ -605,7 +702,8 @@ class VoiceDaemon:
     async def run(self) -> None:
         self._queue = LineQueue()
         self._stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
+        loop = self._loop = asyncio.get_running_loop()
+        self._reset_stream_dir()
 
         await loop.run_in_executor(None, self._ducker.recover)
         self._remove_stale_socket()
@@ -665,6 +763,7 @@ class VoiceDaemon:
 
         _sd_notify("STOPPING=1")
         self._end_current_line()
+        self._discard_prepared()
         await loop.run_in_executor(None, self._ducker.shutdown)
         for task in (worker_task, maintenance_task, watchdog_task):
             task.cancel()
