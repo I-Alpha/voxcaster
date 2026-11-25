@@ -26,6 +26,10 @@ from .engine import KokoroEngine, Piece, SynthesisError
 
 log = logging.getLogger("voxcaster.streaming")
 
+# Characters per chunk of a line that is streamed, and the length under which a
+# chunk is joined to a neighbour because Kokoro reads isolated fragments badly.
+STREAM_CHUNK_CHARS = 100
+MIN_CHUNK_CHARS = 25
 # Seconds of audio a line may buffer ahead of the player before its renderer waits.
 BUFFER_CAP_SEC = 60.0
 # The most silence kept at a join inside a paragraph, split evenly between the two
@@ -106,8 +110,9 @@ class Progress:
     audio_sec: float
     compute_sec: float
     chars_done: int
-    chars_total: int
+    remaining_chars: tuple[int, ...]
     finished: bool
+    buffer_full: bool
 
     @property
     def ratio(self) -> float:
@@ -118,21 +123,31 @@ class Progress:
 def ready_to_start(progress: Progress, previous_ratio: float | None) -> bool:
     """Whether playback can begin without the player running out of audio.
 
-    Playing from now, the audio rendered so far lasts ``audio_sec`` while the rest
-    needs ``ratio * remaining`` of compute, so the stream cannot run dry when
-    ``audio_sec >= (ratio - 1) * remaining``. ``remaining`` is estimated from the
-    characters still to render. A margin on the ratio absorbs piece-to-piece variance.
+    Audio arrives a whole chunk at a time. Playing from now, chunk ``j`` of the
+    ``remaining_chars`` lands after ``ratio * margin`` seconds of compute per second
+    of audio of every chunk up to and including it, and by then the player has
+    consumed that many seconds from the audio rendered so far plus the chunks
+    before ``j``. So for every remaining chunk the buffered audio plus the audio of
+    the chunks before it must cover that compute. Chunk audio is estimated from
+    its characters. A full buffer starts playback regardless, since the renderer
+    cannot add audio until the player drains some.
     """
     if progress.pieces == 0:
         return False
-    if progress.finished:
+    if progress.finished or progress.buffer_full:
         return True
     ratio = progress.ratio
     if progress.audio_sec < MIN_RATIO_AUDIO_SEC and previous_ratio is not None:
         ratio = max(ratio, previous_ratio)
+    ratio *= RATIO_MARGIN
     seconds_per_char = progress.audio_sec / max(progress.chars_done, 1)
-    remaining = max(progress.chars_total - progress.chars_done, 0) * seconds_per_char
-    return progress.audio_sec >= (ratio * RATIO_MARGIN - 1.0) * remaining
+    before = 0.0
+    for chars in progress.remaining_chars:
+        through = before + chars * seconds_per_char
+        if progress.audio_sec + before < ratio * through:
+            return False
+        before = through
+    return True
 
 
 class LineSynth:
@@ -147,7 +162,7 @@ class LineSynth:
     def __init__(self, engine: KokoroEngine, text: str, voice: str | None,
                  on_done: Callable[["LineSynth"], None]) -> None:
         self.engine = engine
-        self.chunks = engine.plan_chunks(text)
+        self.chunks = engine.plan_chunks(text, STREAM_CHUNK_CHARS, MIN_CHUNK_CHARS)
         self.voice = voice
         self.error: SynthesisError | None = None
         self._on_done = on_done
@@ -161,7 +176,8 @@ class LineSynth:
         self._audio_sec = 0.0
         self._compute_sec = 0.0
         self._chars_done = 0
-        self._chars_total = sum(len(c.text) for c in self.chunks)
+        self._chunk_done = [0] * len(self.chunks)
+        self._last_chunk = -1
         self._thread = threading.Thread(target=self._run, name="voxcaster-synth", daemon=True)
         self._thread.start()
 
@@ -176,7 +192,19 @@ class LineSynth:
     def progress(self) -> Progress:
         with self._cv:
             return Progress(self._pieces, self._audio_sec, self._compute_sec,
-                            self._chars_done, self._chars_total, self._done)
+                            self._chars_done, self._remaining_chars(), self._done,
+                            self._buffered_sec >= BUFFER_CAP_SEC)
+
+    def _remaining_chars(self) -> tuple[int, ...]:
+        """Characters still to render in each unfinished chunk, the one in progress first."""
+        left = []
+        for index in range(max(self._last_chunk, 0), len(self.chunks)):
+            rest = len(self.chunks[index].text)
+            if index == self._last_chunk:
+                rest -= self._chunk_done[index]
+            if rest > 0:
+                left.append(rest)
+        return tuple(left)
 
     def wait_progress(self, timeout: float) -> None:
         with self._cv:
@@ -248,6 +276,8 @@ class LineSynth:
             self._pieces += 1
             self._compute_sec += piece.compute_seconds
             self._chars_done += piece.chars
+            self._chunk_done[piece.chunk_index] += piece.chars
+            self._last_chunk = max(self._last_chunk, piece.chunk_index)
             self._cv.notify_all()
 
     def _append(self, samples: np.ndarray) -> None:

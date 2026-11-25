@@ -129,7 +129,7 @@ def test_synthesize_returns_every_piece_untrimmed_and_in_order(clock):
 def test_an_open_stream_keeps_its_pipeline_in_place_until_it_is_closed(engine, clock):
     engine.synthesize("hi")
     clock.now += 10 * IDLE_UNLOAD
-    stream = engine.stream(engine.plan_chunks("one\ntwo"))
+    stream = engine.stream(engine.plan_chunks("one\ntwo", engine_module.RENDER_CHUNK_CHARS))
     next(stream)
     sweeper = threading.Thread(target=engine.unload_idle)
     sweeper.start()

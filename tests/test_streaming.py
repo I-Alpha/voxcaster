@@ -13,6 +13,7 @@ from fakes import SAMPLE_RATE, FakeKokoro
 
 from voxcaster import protocol, streaming
 from voxcaster.daemon import VoiceDaemon
+from voxcaster.engine import RENDER_CHUNK_CHARS, KokoroEngine
 from voxcaster.streaming import Progress, ready_to_start
 
 
@@ -93,15 +94,15 @@ def test_joins_inside_a_paragraph_are_trimmed_to_one_pause_and_paragraph_breaks_
     cfg = make_cfg(tmp_path)
     kokoro = FakeKokoro(audio_sec=0.2, lead_sec=0.4, tail_sec=0.4)
     (player,) = speak_and_wait(cfg, sentences(6) + "\nA new paragraph.", kokoro)
-    assert len(kokoro.pieces) == 4
+    assert len(kokoro.pieces) == 7
     speech = np.flatnonzero(player.pcm)
     gaps = np.diff(speech)[np.diff(speech) > 1] - 1
-    assert len(gaps) == 3
+    assert len(gaps) == 6
     assert np.array_equal(player.pcm[speech],
                           np.concatenate([kokoro.speech(p[0]) for p in kokoro.pieces]))
-    inside = gaps[:2] / SAMPLE_RATE
+    inside = gaps[:5] / SAMPLE_RATE
     assert ((0.1 <= inside) & (inside <= 0.4)).all()
-    assert gaps[2] == int(0.8 * SAMPLE_RATE)
+    assert gaps[5] == int(0.8 * SAMPLE_RATE)
 
 
 def test_slow_synthesis_delays_the_start_instead_of_running_dry(tmp_path):
@@ -279,11 +280,100 @@ def test_starting_the_daemon_empties_its_own_directory_and_nothing_else(tmp_path
     assert neighbour.exists() and foreign.exists()
 
 
+def progress(audio_sec, compute_sec, chars_done, remaining_chars, buffer_full=False):
+    return Progress(pieces=1, audio_sec=audio_sec, compute_sec=compute_sec, chars_done=chars_done,
+                    remaining_chars=remaining_chars, finished=False, buffer_full=buffer_full)
+
+
 def test_a_slow_previous_line_holds_back_the_start_of_a_line_that_has_rendered_little():
-    early = Progress(pieces=1, audio_sec=1.0, compute_sec=0.1, chars_done=10, chars_total=100,
-                     finished=False)
+    early = progress(1.0, 0.1, 10, (10,) * 9)
     assert ready_to_start(early, previous_ratio=None)
     assert not ready_to_start(early, previous_ratio=3.0)
+
+
+def test_a_short_opening_paragraph_followed_by_a_long_chunk_does_not_start_on_piece_one():
+    assert not ready_to_start(progress(1.0, 0.85, 20, (300,)), previous_ratio=None)
+
+
+def test_a_line_of_short_chunks_starts_on_piece_one_at_a_fast_ratio():
+    assert ready_to_start(progress(1.0, 0.3, 20, (20,) * 10), previous_ratio=None)
+
+
+def test_a_full_buffer_starts_playback_however_much_is_still_to_render():
+    waiting = progress(1.0, 1.5, 20, (20,) * 50)
+    assert not ready_to_start(waiting, previous_ratio=None)
+    assert ready_to_start(progress(1.0, 1.5, 20, (20,) * 50, buffer_full=True), previous_ratio=None)
+
+
+def sentence(k, length):
+    head = f"Sentence {k} "
+    return head + "x" * (length - len(head) - 1) + "."
+
+
+def chunk_texts(text, budget, min_chars=0):
+    return [c.text for c in KokoroEngine.plan_chunks(text, budget, min_chars)]
+
+
+def test_sentences_are_packed_whole_up_to_the_budget():
+    sentences_ = [sentence(k, 45) for k in range(6)]
+    chunks = chunk_texts(" ".join(sentences_), 100)
+    assert chunks == [" ".join(sentences_[i:i + 2]) for i in (0, 2, 4)]
+
+
+def test_a_sentence_longer_than_the_budget_stays_whole():
+    long_one, other = sentence(0, 250), sentence(1, 45)
+    assert chunk_texts(f"{long_one} {other}", 100) == [long_one, other]
+
+
+def test_the_render_budget_packs_the_same_text_into_larger_chunks():
+    text = " ".join(sentence(k, 45) for k in range(14))
+    chunks = chunk_texts(text, RENDER_CHUNK_CHARS)
+    assert max(map(len, chunks)) <= RENDER_CHUNK_CHARS and len(chunks) == 3
+    assert " ".join(chunks) == text
+
+
+def test_a_short_sentence_is_joined_to_the_next_and_a_trailing_one_to_the_previous():
+    leading, first, second = "Yes.", sentence(1, 99), sentence(2, 99)
+    assert chunk_texts(f"{leading} {first} {second}", 100, 25) == [f"{leading} {first}", second]
+    trailing = "Ok then."
+    assert chunk_texts(f"{first} {second} {trailing}", 100, 25) == [first, f"{second} {trailing}"]
+
+
+def test_a_short_paragraph_is_never_merged_across_the_break():
+    chunks = KokoroEngine.plan_chunks("Yes.\n" + sentence(1, 90), 100, 25)
+    assert [(c.text, c.paragraph_start) for c in chunks] == [("Yes.", False), (sentence(1, 90), True)]
+
+
+def test_a_streamed_line_is_rendered_in_small_whole_sentence_chunks(tmp_path):
+    cfg = make_cfg(tmp_path)
+    text = " ".join(sentence(k, 80) for k in range(12))
+    kokoro = FakeKokoro(delay=0.01, audio_sec=0.1)
+    speak_and_wait(cfg, text, kokoro)
+    assert " ".join(p[0] for p in kokoro.pieces) == text
+    assert max(len(p[0]) for p in kokoro.pieces) <= 120
+
+
+def test_a_short_opening_paragraph_followed_by_a_long_one_starts_without_running_dry(tmp_path):
+    cfg = make_cfg(tmp_path)
+    text = "Short opening line.\n" + " ".join(sentence(k, 80) for k in range(5))
+    kokoro = FakeKokoro(sec_per_char=0.01, ratio=0.7)
+    (player,) = speak_and_wait(cfg, text, kokoro)
+    assert player.count("underrun") == 0
+    assert np.array_equal(player.pcm, kokoro.received())
+
+
+def test_a_start_that_needs_more_than_the_buffer_holds_starts_when_the_buffer_is_full(tmp_path, monkeypatch):
+    monkeypatch.setattr(streaming, "BUFFER_CAP_SEC", 1.0)
+    cfg = make_cfg(tmp_path)
+    kokoro = FakeKokoro(delay=0.3, audio_sec=0.2)
+
+    async def scenario(daemon):
+        await speak(cfg, lines(12))
+        await until(lambda: played(cfg) and played(cfg)[0].t("first_byte"), timeout=5)
+        await until(lambda: played(cfg)[0].t("exit"), timeout=15)
+
+    run_playing_daemon(cfg, scenario, kokoro)
+    assert np.array_equal(played(cfg)[0].pcm, kokoro.received())
 
 
 def test_a_daemon_directory_that_is_not_a_real_directory_of_ours_is_refused_and_left_alone(tmp_path):

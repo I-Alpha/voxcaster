@@ -47,6 +47,9 @@ log = logging.getLogger("voxcaster.engine")
 # Kokoro's native output sample rate; individual results may override it.
 DEFAULT_SAMPLE_RATE = 24000
 
+# Characters per chunk when rendering a whole line to a file.
+RENDER_CHUNK_CHARS = 320
+
 
 class SynthesisError(RuntimeError):
     """TTS synthesis failed (model unavailable, OOM, bad input, ...).
@@ -328,39 +331,64 @@ class KokoroEngine:
     # Chunking keeps breaks on sentence boundaries. Kokoro batches long text
     # itself (KPipeline.en_tokenize, 510 phonemes), so nothing is lost without it.
     _SENTENCE_SPLIT = re.compile(r'(?<=[.!?:;])\s+(?=[A-Z0-9"\'(])')
-    _CHUNK_BUDGET_CHARS = 320
 
     @classmethod
-    def plan_chunks(cls, text: str) -> list[Chunk]:
+    def plan_chunks(cls, text: str, budget: int, min_chars: int = 0) -> list[Chunk]:
         """Split ``text`` into the chunks the pipeline renders one at a time.
 
-        Each newline-separated paragraph is packed into <= _CHUNK_BUDGET_CHARS
-        chunks on sentence boundaries. A single sentence longer than the budget
-        is left intact rather than cut mid-clause.
+        Each newline-separated paragraph is packed into chunks of whole sentences
+        of at most ``budget`` characters; a sentence longer than the budget stays
+        whole. With ``min_chars``, a chunk shorter than that is joined to the next
+        chunk of its paragraph, or to the previous one when it is the last, so a
+        chunk can exceed the budget by up to ``min_chars``. A paragraph shorter
+        than ``min_chars`` is never joined to its neighbours.
         """
         chunks: list[Chunk] = []
         for para in text.split('\n'):
             para = para.strip()
             if not para:
                 continue
-            pieces: list[str] = []
-            if len(para) <= cls._CHUNK_BUDGET_CHARS:
-                pieces.append(para)
-            else:
-                cur = ''
-                for sent in cls._SENTENCE_SPLIT.split(para):
-                    if not sent:
-                        continue
-                    if cur and len(cur) + 1 + len(sent) > cls._CHUNK_BUDGET_CHARS:
-                        pieces.append(cur)
-                        cur = sent
-                    else:
-                        cur = f'{cur} {sent}' if cur else sent
-                if cur:
-                    pieces.append(cur)
+            pieces = cls._pack_sentences(para, budget)
+            if min_chars:
+                pieces = cls._join_short(pieces, min_chars)
             for n, piece in enumerate(pieces):
                 chunks.append(Chunk(piece, paragraph_start=n == 0 and bool(chunks)))
         return chunks
+
+    @classmethod
+    def _pack_sentences(cls, para: str, budget: int) -> list[str]:
+        if len(para) <= budget:
+            return [para]
+        pieces: list[str] = []
+        cur = ''
+        for sent in cls._SENTENCE_SPLIT.split(para):
+            if not sent:
+                continue
+            if cur and len(cur) + 1 + len(sent) > budget:
+                pieces.append(cur)
+                cur = sent
+            else:
+                cur = f'{cur} {sent}' if cur else sent
+        if cur:
+            pieces.append(cur)
+        return pieces
+
+    @staticmethod
+    def _join_short(pieces: list[str], min_chars: int) -> list[str]:
+        joined: list[str] = []
+        carry = ''
+        for n, piece in enumerate(pieces):
+            if carry:
+                piece, carry = f'{carry} {piece}', ''
+            if len(piece) >= min_chars:
+                joined.append(piece)
+            elif n < len(pieces) - 1:
+                carry = piece
+            elif joined:
+                joined[-1] += f' {piece}'
+            else:
+                joined.append(piece)
+        return joined
 
     @staticmethod
     def _result_samples(result) -> np.ndarray | None:
@@ -456,5 +484,5 @@ class KokoroEngine:
         Returns ``(samples, sample_rate)``. Raises :class:`SynthesisError`
         on any failure. Blocking: call from a thread executor.
         """
-        pieces = list(self.stream(self.plan_chunks(text), voice))
+        pieces = list(self.stream(self.plan_chunks(text, RENDER_CHUNK_CHARS), voice))
         return np.concatenate([p.samples for p in pieces]), pieces[-1].sample_rate
