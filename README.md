@@ -83,8 +83,8 @@ process, and overlapping lines talk over each other. `voxcaster` inverts this:
   request simply synthesizes on CPU instead of failing.
 - **Gapless streaming**: a line of any length is one call. Kokoro renders it
   piece by piece and the audio is streamed to the player while the rest is
-  still being made, so speech starts after the first piece when synthesis is
-  fast and after enough buffering when it is not, and never cuts off or skips.
+  still being made, so speech starts after the first sentences when synthesis
+  is fast and after enough buffering when it is not, and never cuts off or skips.
   While a line plays the next queued line is rendered ahead, so lines follow
   each other without waiting for synthesis. The silence Kokoro adds between
   the pieces of one paragraph is trimmed to one natural pause; a line break in

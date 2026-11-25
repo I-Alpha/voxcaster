@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Gapless streaming. A speak line of any length is rendered piece by piece and
   streamed to one player process through a named pipe, so playback starts
-  before the whole line is rendered. Playback begins after the first piece
-  when synthesis is fast, and after enough buffering when it is slower than
-  real time; a stream that still runs dry waits at a piece boundary and
-  carries on without losing audio.
+  before the whole line is rendered. Text is rendered in chunks of whole
+  sentences of about 100 characters (a sentence is never cut, and one shorter
+  than 25 characters is joined to a neighbour in its paragraph). Playback
+  begins when the measured synthesis speed shows that every later chunk will
+  arrive before the audio rendered so far runs out: after the first chunk when
+  synthesis is fast, after more buffering when it is slower, and when the
+  buffer is full when it is too slow to ever catch up. A stream that still runs
+  dry waits at a chunk boundary and carries on without losing audio.
 - While a line plays, the next queued speak line is rendered ahead (one line,
   bounded buffer), so lines follow each other without a synthesis gap. Drop,
   clear, stop and interrupt discard it.
